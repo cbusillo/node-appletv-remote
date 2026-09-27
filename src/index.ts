@@ -14,5 +14,6 @@ export { SupportedCommand, Command } from './supported-command.js';
 export { Message } from './message.js';
 export { MRPMessage, MessageType } from './mrp/messages.js';
 export { AirPlayConnection } from './connection.js';
+export type { AirPlayConnectionOptions } from './connection.js';
 export type { HAPCredentials } from './auth/types.js';
 export type { ScanOptions, DiscoveredDevice } from './discovery.js';

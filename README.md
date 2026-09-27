@@ -312,10 +312,31 @@ and reply type `MessageType.GetVolumeResult`. Missing result fields remain absen
 they are not interpreted as zero. Callers must bind a result to the output
 generation that issued the request, since the reply itself has no output ID.
 
-These extensions do not provide a complete player-state reducer or qualify the
-long-lived AirPlay transport. Consumers must track explicit active player/output
-selection and invalidate feedback on connection loss. Data/event socket loss is
-forwarded through the connection's existing error/close events.
+Consumers must track explicit active player/output selection and invalidate
+feedback on connection loss; these extensions do not provide a complete reducer.
+
+### AirPlay connection lifetime
+
+Each `AirPlayConnection` owns one lifetime. Pass an optional fourth constructor
+argument `{ timeoutMs, logger }` to set the socket/HTTP/write deadline (default
+10 seconds) and replace debug logging. `connect({ signal })` accepts cancellation
+throughout setup and the connected lifetime. Use a new instance after close or
+failure. `scan({ signal })` also cancels its mDNS browsers and deadline.
+
+Closing settles pending connects, writes, HTTP/RTSP and MRP requests, destroys all
+owned sockets, clears heartbeat timers, and emits one close event. Errors also
+reach registered error listeners. No connection or request is retried. Complete
+encrypted frames are consumed separately from partial plaintext HTTP replies;
+all coalesced replies are processed. RTSP replies match CSeq and MRP replies match
+the request identifier. Untyped MRP acknowledgements are supported when no response
+type is required; errors and wrong response types reject instead of accepting an
+unrelated state push. Only one heartbeat can be outstanding.
+
+Regression tests cover fragmented/reordered replies, immediate replies during
+write, failures, concurrent requests, cancellation, and real loopback TCP cleanup.
+Two read-only sessions against one TV also connected, observed metadata, closed,
+and exited naturally without remaining TCP sockets. Longer outage/soak coverage
+and integration into a persistent application controller remain separate work.
 
 ```bash
 # Install dependencies

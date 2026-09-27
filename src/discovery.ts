@@ -50,14 +50,16 @@ export class DiscoveredDevice {
 export interface ScanOptions {
   timeout?: number;
   filter?: (device: DiscoveredDevice) => boolean;
+  signal?: AbortSignal;
 }
 
 export async function scan(options: ScanOptions = {}): Promise<DiscoveredDevice[]> {
   const timeout = options.timeout ?? 5000;
+  options.signal?.throwIfAborted();
   const devices = new Map<string, DiscoveredDevice>();
   const companionPorts = new Map<string, number>();
 
-  return new Promise((resolve) => {
+  return new Promise((resolve, reject) => {
     const instance = new Bonjour();
 
     const browser = instance.find({ type: 'airplay', protocol: 'tcp' }, (service: Service) => {
@@ -103,16 +105,27 @@ export async function scan(options: ScanOptions = {}): Promise<DiscoveredDevice[
       },
     );
 
-    setTimeout(() => {
+    let finished = false;
+    const finish = (cancelled = false) => {
+      if (finished) return;
+      finished = true;
+      clearTimeout(timer);
+      options.signal?.removeEventListener('abort', onAbort);
       browser.stop();
       companionBrowser.stop();
       instance.destroy();
-
-      let result = Array.from(devices.values());
-      if (options.filter) {
-        result = result.filter(options.filter);
+      if (cancelled) { reject(options.signal?.reason); return; }
+      try {
+        let result = Array.from(devices.values());
+        if (options.filter) result = result.filter(options.filter);
+        resolve(result.sort((a, b) => a.name.localeCompare(b.name)));
+      } catch (error) {
+        reject(error);
       }
-      resolve(result.sort((a, b) => a.name.localeCompare(b.name)));
-    }, timeout);
+    };
+    const onAbort = () => finish(true);
+    const timer = setTimeout(() => finish(), timeout);
+    options.signal?.addEventListener('abort', onAbort, { once: true });
+    if (options.signal?.aborted) onAbort();
   });
 }
