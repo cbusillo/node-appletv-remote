@@ -6,15 +6,17 @@
  */
 
 import { Socket } from 'node:net';
-import { generateKeyPairSync, sign, createPrivateKey, randomUUID } from 'node:crypto';
+import { generateKeyPairSync, sign, verify, createPrivateKey, createPublicKey, randomUUID } from 'node:crypto';
 import { TlvTag, tlvEncode, tlvDecode } from '../util/tlv.js';
 import { hkdfSha512, encryptChaCha20, decryptChaCha20 } from '../util/crypto.js';
 import { SRPClient } from '../auth/srp.js';
 import { FrameType, encodeFrame, parseFrames, type Frame } from './framing.js';
 import { opackEncode, opackDecode, type OpackDict, type OpackValue } from './opack.js';
 import type { HAPCredentials } from '../auth/types.js';
+import { PendingRequests } from '../util/pending-requests.js';
 
 const ED25519_PKCS8_PREFIX = Buffer.from('302e020100300506032b657004220420', 'hex');
+const ED25519_SPKI_PREFIX = Buffer.from('302a300506032b6570032100', 'hex');
 
 export class CompanionPairSetup {
   private socket: Socket | undefined;
@@ -31,12 +33,23 @@ export class CompanionPairSetup {
 
   /** Queued frames that arrived before anyone was waiting for them. */
   private frameQueue: Frame[] = [];
-  private pendingFrameResolvers: Array<(frame: Frame) => void> = [];
+  private pending = new PendingRequests(error => this.shutdown(error), 'Companion pairing');
+  private phase: 'new' | 'starting' | 'pin' | 'finishing' | 'closed' = 'new';
+  private removeAbortListener?: () => void;
+  private resolveClosed!: () => void;
+  /** Settles on every shutdown, including peer closure while awaiting the user's PIN. */
+  readonly closed = new Promise<void>(resolve => { this.resolveClosed = resolve; });
+  private pairingStage: 'connect' | 'pin' | 'proof' | 'identity' | 'complete' = 'connect';
+  /** Last pairing stage, retained after shutdown without exposing protocol payloads. */
+  get stage(): typeof this.pairingStage { return this.pairingStage; }
 
   constructor(
     private host: string,
     private port: number,
+    private options: { timeoutMs?: number } = {},
   ) {
+    if (!host || !Number.isInteger(port) || port < 1 || port > 65535) throw new RangeError('Invalid pairing target');
+    if (!Number.isFinite(this.timeoutMs) || this.timeoutMs <= 0) throw new RangeError('Invalid pairing timeout');
     this.clientId = randomUUID();
 
     const { publicKey, privateKey } = generateKeyPairSync('ed25519');
@@ -52,28 +65,59 @@ export class CompanionPairSetup {
    * Open socket and send M1. The Apple TV should display the PIN after this.
    * Call finish(pin) after the user reads the PIN.
    */
-  async start(): Promise<void> {
-    await this.openSocket();
-    const { salt, serverPublicKey } = await this.sendM1();
-    this.salt = salt;
-    this.serverPublicKey = serverPublicKey;
+  async start(options: { signal?: AbortSignal } = {}): Promise<void> {
+    if (this.phase !== 'new') throw new Error('Pairing can only start once');
+    this.phase = 'starting';
+    const { signal } = options;
+    if (signal) {
+      const cancel = () => this.shutdown(new Error('Companion pairing cancelled'));
+      signal.addEventListener('abort', cancel, { once: true });
+      this.removeAbortListener = () => signal.removeEventListener('abort', cancel);
+      if (signal.aborted) cancel();
+    }
+    try {
+      this.assertOpen();
+      await this.openSocket();
+      const { salt, serverPublicKey } = await this.sendM1();
+      this.assertOpen();
+      this.salt = salt;
+      this.serverPublicKey = serverPublicKey;
+      this.phase = 'pin';
+      this.pairingStage = 'pin';
+    } catch (error) {
+      this.shutdown(new Error('Companion pairing startup failed'));
+      throw error;
+    }
+  }
+
+  private get timeoutMs(): number { return this.options.timeoutMs ?? 10000; }
+
+  private assertOpen(): void {
+    if (this.phase === 'closed') throw new Error('Companion pairing is closed');
   }
 
   private openSocket(): Promise<void> {
-    return new Promise((resolve, reject) => {
-      this.socket = new Socket();
-      this.socket.connect(this.port, this.host, () => {
-        this.socket!.setNoDelay(true);
-        resolve();
-      });
-      this.socket.on('error', (err) => {
-        reject(err);
-      });
-      this.socket.on('data', (data: Buffer) => {
+    this.assertOpen();
+    const connected = this.pending.create<void>('connect', this.timeoutMs);
+    const socket = new Socket();
+    this.socket = socket;
+    socket.on('error', error => this.shutdown(error));
+    socket.on('close', () => this.shutdown(new Error('Companion pairing connection closed')));
+    socket.on('data', (data: Buffer) => {
+      if (this.phase === 'closed') return;
+      try {
         this.buffer = Buffer.concat([this.buffer, data]);
+        if (this.buffer.length > 1024 * 1024) throw new Error('Pairing frame is too large');
         this.processFrames();
-      });
+      } catch {
+        this.shutdown(new Error('Invalid Companion pairing frame'));
+      }
     });
+    socket.connect(this.port, this.host, () => {
+      socket.setNoDelay(true);
+      this.pending.resolve('connect', undefined);
+    });
+    return connected;
   }
 
   /**
@@ -99,6 +143,7 @@ export class CompanionPairSetup {
    */
   private async receivePairingData(): Promise<Buffer> {
     const frame = await this.waitForAnyFrame();
+    if (frame.type !== FrameType.PS_Next) throw new Error('Unexpected Companion pairing response');
     const decoded = opackDecode(frame.payload);
     if (!(decoded instanceof Map)) {
       throw new Error(`Companion PS: expected OPACK dict response, got frame type 0x${frame.type.toString(16)}`);
@@ -135,6 +180,7 @@ export class CompanionPairSetup {
   }
 
   async sendM3(pin: string, salt: Buffer, serverPublicKey: Buffer): Promise<void> {
+    this.pairingStage = 'proof';
     this.srp.init(salt, pin);
     this.srp.setServerPublicKey(serverPublicKey);
 
@@ -162,6 +208,7 @@ export class CompanionPairSetup {
   }
 
   async sendM5(): Promise<HAPCredentials> {
+    this.pairingStage = 'identity';
     if (!this.sessionKey) {
       throw new Error('Session key not available; call sendM3 first');
     }
@@ -225,9 +272,20 @@ export class CompanionPairSetup {
     const serverInfo = tlvDecode(decrypted);
     const serverId = serverInfo[TlvTag.Identifier];
     const serverLTPK = serverInfo[TlvTag.PublicKey];
-    if (!serverId || !serverLTPK) {
-      throw new Error('Companion PS M6 missing Identifier or PublicKey');
+    const serverSignature = serverInfo[TlvTag.Signature];
+    if (!serverId?.length || serverLTPK?.length !== 32 || serverSignature?.length !== 64) {
+      throw new Error('Companion PS M6 missing valid identity or signature');
     }
+
+    const accessoryKey = await hkdfSha512(
+      this.sessionKey, 'Pair-Setup-Accessory-Sign-Salt', 'Pair-Setup-Accessory-Sign-Info', 32,
+    );
+    const publicKey = createPublicKey({ key: Buffer.concat([ED25519_SPKI_PREFIX, serverLTPK]), format: 'der', type: 'spki' });
+    if (!verify(null, Buffer.concat([accessoryKey, serverId, serverLTPK]), publicKey, serverSignature))
+      throw new Error('Companion PS M6 signature verification failed');
+    this.assertOpen();
+
+    this.pairingStage = 'complete';
 
     return {
       clientId: this.clientId,
@@ -243,9 +301,11 @@ export class CompanionPairSetup {
    * start() must have been called first (sends M1, receives M2).
    */
   async finish(pin: string): Promise<HAPCredentials> {
-    if (!this.salt || !this.serverPublicKey) {
+    if (this.phase !== 'pin' || !this.salt || !this.serverPublicKey) {
       throw new Error('start() must be called before finish()');
     }
+    if (!/^\d{4}$/.test(pin)) throw new Error('Expected a four-digit PIN');
+    this.phase = 'finishing';
     try {
       await this.sendM3(pin, this.salt, this.serverPublicKey);
       return await this.sendM5();
@@ -255,35 +315,37 @@ export class CompanionPairSetup {
   }
 
   destroy(): void {
+    this.shutdown(new Error('Companion pairing closed'));
+  }
+
+  private shutdown(error: Error): void {
+    if (this.phase === 'closed') return;
+    this.phase = 'closed';
+    this.removeAbortListener?.();
+    this.removeAbortListener = undefined;
+    this.pending.rejectAll(error);
     this.socket?.destroy();
     this.socket = undefined;
+    this.buffer = Buffer.alloc(0);
+    this.frameQueue = [];
+    this.salt = this.serverPublicKey = this.sessionKey = undefined;
+    this.resolveClosed();
   }
 
   private writeFrame(type: FrameType, payload: Buffer): void {
+    this.assertOpen();
+    if (!this.socket) throw new Error('Companion pairing is not connected');
     const frame = encodeFrame(type, payload);
-    this.socket?.write(frame);
+    this.socket.write(frame, error => { if (error) this.shutdown(error); });
   }
 
-  private waitForAnyFrame(timeoutMs = 10000): Promise<Frame> {
+  private waitForAnyFrame(): Promise<Frame> {
+    this.assertOpen();
     if (this.frameQueue.length > 0) {
       return Promise.resolve(this.frameQueue.shift()!);
     }
 
-    return new Promise((resolve, reject) => {
-      const onFrame = (frame: Frame): void => {
-        clearTimeout(timer);
-        resolve(frame);
-      };
-
-      const timer = setTimeout(() => {
-        const idx = this.pendingFrameResolvers.indexOf(onFrame);
-        if (idx >= 0) this.pendingFrameResolvers.splice(idx, 1);
-        reject(new Error('Companion PS timeout waiting for response frame'));
-      }, timeoutMs);
-
-      this.pendingFrameResolvers.push(onFrame);
-      this.processFrames();
-    });
+    return this.pending.create<Frame>('frame', this.timeoutMs);
   }
 
   private processFrames(): void {
@@ -291,10 +353,10 @@ export class CompanionPairSetup {
     this.buffer = remainder;
 
     for (const frame of frames) {
-      const resolver = this.pendingFrameResolvers.shift();
-      if (resolver) {
-        resolver(frame);
+      if (this.pending.has('frame')) {
+        this.pending.resolve('frame', frame);
       } else {
+        if (this.frameQueue.length >= 8) throw new Error('Unexpected queued pairing frames');
         this.frameQueue.push(frame);
       }
     }

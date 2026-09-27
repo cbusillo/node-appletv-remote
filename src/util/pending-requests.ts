@@ -4,14 +4,14 @@ type Pending = { resolve(value: unknown): void; reject(error: Error): void };
 export class PendingRequests {
   private entries = new Map<string, Pending>();
 
-  constructor(private onTimeout: (error: Error) => void) {}
+  constructor(private onTimeout: (error: Error) => void, private label = 'AirPlay') {}
 
   create<T>(key: string, timeoutMs: number): Promise<T> {
-    if (this.entries.has(key)) throw new Error('An equivalent AirPlay request is already pending');
+    if (this.entries.has(key)) throw new Error(`An equivalent ${this.label} request is already pending`);
     return new Promise<T>((resolve, reject) => {
       const finish = () => { clearTimeout(timer); this.entries.delete(key); };
       const timer = setTimeout(() => {
-        const error = new Error('AirPlay request timed out');
+        const error = new Error(`${this.label} request timed out`);
         this.reject(key, error);
         this.onTimeout(error);
       }, timeoutMs);
