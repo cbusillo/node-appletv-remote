@@ -57,7 +57,8 @@ export class CompanionConnection extends EventEmitter {
   private socket: Socket | undefined;
   private session: CompanionSession | undefined;
   private buffer: Buffer = Buffer.alloc(0);
-  private transferId = 0;
+  // A real TV may treat transaction zero as unacknowledged traffic.
+  private transferId = 1;
   private pendingRequests = new Map<number, {
     resolve: (value: OpackDict) => void;
     reject: (error: Error) => void;
@@ -79,6 +80,8 @@ export class CompanionConnection extends EventEmitter {
   private openSocket(): Promise<void> {
     return new Promise((resolve, reject) => {
       this.socket = new Socket();
+      // Touch events are paced by the caller; Nagle buffering distorts gestures.
+      this.socket.setNoDelay(true);
       this.socket.connect(this.port, this.host, () => resolve());
       this.socket.on('error', (err) => {
         reject(err);
@@ -288,6 +291,7 @@ export class CompanionConnection extends EventEmitter {
     }
 
     content.set('_i', identifier);
+    if (!content.has('_x')) content.set('_x', this.transferId++);
     const payload = opackEncode(content);
     const encrypted = this.session.encrypt(FrameType.E_OPACK, payload);
     this.writeRaw(encrypted);
@@ -365,11 +369,10 @@ export class CompanionConnection extends EventEmitter {
 
   private processEncryptedFrames(): void {
     // Encrypted frames: 4-byte header + ciphertext + 16-byte tag
-    // The header contains the plaintext length, so total = 4 + plaintextLen + 16
+    // The header length already includes the authentication tag.
     while (this.buffer.length >= 4) {
-      const plaintextLen =
-        (this.buffer[1] << 16) | (this.buffer[2] << 8) | this.buffer[3];
-      const totalLen = 4 + plaintextLen + 16;
+      const payloadLen = this.buffer.readUIntBE(1, 3);
+      const totalLen = 4 + payloadLen;
 
       if (this.buffer.length < totalLen) break;
 
@@ -395,7 +398,7 @@ export class CompanionConnection extends EventEmitter {
     const identifier = dict.get('_i');
 
     // Check if this is a response to a pending request
-    if (typeof transferId === 'number' && this.pendingRequests.has(transferId)) {
+    if (dict.get('_t') === 3 && typeof transferId === 'number' && this.pendingRequests.has(transferId)) {
       const pending = this.pendingRequests.get(transferId)!;
       this.pendingRequests.delete(transferId);
       pending.resolve(dict);

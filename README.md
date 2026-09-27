@@ -277,6 +277,21 @@ src/
 
 ## Development
 
+### OPACK values
+
+For low-level Companion requests, wrap integral values in `new OpackFloat(value)`
+when the protocol requires a floating-point value, such as skip seconds or the
+volume endpoints 0 and 1. Ordinary nonnegative safe integers keep their compact
+integer encoding. Negative numbers use float64; unsigned 64-bit identifiers
+must use `bigint` to preserve precision. The decoder accepts compact and extended
+object references in device replies.
+
+Encrypted Companion frame lengths include their authentication tag. Independent
+pyatv fixtures verify both encryption and streaming reception of these frames.
+
+The compatibility tests include independent fixtures from pyatv 0.18.0 and the
+[published OPACK protocol examples](https://pyatv.dev/documentation/protocols/#opack).
+
 ```bash
 # Install dependencies
 npm install

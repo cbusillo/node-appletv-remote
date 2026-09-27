@@ -55,6 +55,7 @@ export interface ScanOptions {
 export async function scan(options: ScanOptions = {}): Promise<DiscoveredDevice[]> {
   const timeout = options.timeout ?? 5000;
   const devices = new Map<string, DiscoveredDevice>();
+  const companionPorts = new Map<string, number>();
 
   return new Promise((resolve) => {
     const instance = new Bonjour();
@@ -78,6 +79,7 @@ export async function scan(options: ScanOptions = {}): Promise<DiscoveredDevice[
             port: service.port,
             deviceId: parsed.deviceId,
             model: parsed.model,
+            companionPort: companionPorts.get(address),
           }),
         );
       }
@@ -90,6 +92,8 @@ export async function scan(options: ScanOptions = {}): Promise<DiscoveredDevice[
           (a) => a.includes('.') && !a.startsWith('169.254'),
         );
         if (!address) return;
+
+        companionPorts.set(address, service.port);
 
         for (const device of devices.values()) {
           if (device.address === address) {

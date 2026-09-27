@@ -11,10 +11,16 @@ export type OpackValue =
   | bigint
   | string
   | Buffer
+  | OpackFloat
   | OpackValue[]
   | OpackDict;
 
 export type OpackDict = Map<OpackValue, OpackValue>;
+
+/** Preserve a floating-point wire type for integral seconds and volume limits. */
+export class OpackFloat {
+  constructor(readonly value: number) {}
+}
 
 // --- Type tags (matched to pyatv) ---
 const TAG_NULL = 0x04;
@@ -85,11 +91,20 @@ function encodeValue(value: OpackValue, parts: Buffer[]): void {
   }
 
   if (typeof value === 'number') {
-    if (Number.isInteger(value)) {
+    // OPACK integers are unsigned. Negative numbers must use a float.
+    if (Number.isInteger(value) && value >= 0 && !Object.is(value, -0)) {
+      if (!Number.isSafeInteger(value)) {
+        throw new RangeError('Use bigint for OPACK integers above Number.MAX_SAFE_INTEGER');
+      }
       encodeInteger(value, parts);
     } else {
       encodeFloat(value, parts);
     }
+    return;
+  }
+
+  if (value instanceof OpackFloat) {
+    encodeFloat(value.value, parts);
     return;
   }
 
@@ -150,14 +165,14 @@ function encodeInteger(value: number, parts: Buffer[]): void {
   // Fall through to int64
   const buf = Buffer.alloc(9);
   buf[0] = TAG_INT64;
-  buf.writeBigInt64LE(BigInt(value), 1);
+  buf.writeBigUInt64LE(BigInt(value), 1);
   parts.push(buf);
 }
 
 function encodeBigInt(value: bigint, parts: Buffer[]): void {
   const buf = Buffer.alloc(9);
   buf[0] = TAG_INT64;
-  buf.writeBigInt64LE(value, 1);
+  buf.writeBigUInt64LE(value, 1);
   parts.push(buf);
 }
 
@@ -242,7 +257,7 @@ function encodeDict(value: OpackDict, parts: Buffer[]): void {
 // --- Decoder ---
 
 export function opackDecode(buffer: Buffer): OpackValue {
-  const result = decodeValue(buffer, 0);
+  const result = decodeValue(buffer, 0, []);
   return result.value;
 }
 
@@ -251,7 +266,29 @@ interface DecodeResult {
   offset: number;
 }
 
-function decodeValue(buf: Buffer, offset: number): DecodeResult {
+function decodeValue(buf: Buffer, offset: number, objects: OpackValue[]): DecodeResult {
+  const tag = buf[offset];
+  if (tag >= 0xa0 && tag <= 0xc4) {
+    const width = tag <= 0xc0 ? 0 : tag - 0xc0;
+    const index = width === 0 ? tag - 0xa0 : buf.readUIntLE(offset + 1, width);
+    if (index >= objects.length) {
+      throw new Error(`OPACK: invalid object reference ${index}`);
+    }
+    return { value: objects[index], offset: offset + 1 + width };
+  }
+
+  const result = decodeLiteral(buf, offset, objects);
+  const value = result.value;
+  // Containers, single-byte objects and existing values do not add table entries.
+  if (result.offset - offset > 1 && !Array.isArray(value) && !(value instanceof Map)
+      && !objects.some(item => Buffer.isBuffer(item) && Buffer.isBuffer(value)
+        ? item.equals(value) : Object.is(item, value))) {
+    objects.push(value);
+  }
+  return result;
+}
+
+function decodeLiteral(buf: Buffer, offset: number, objects: OpackValue[]): DecodeResult {
   if (offset >= buf.length) {
     throw new Error('OPACK: unexpected end of buffer');
   }
@@ -359,38 +396,38 @@ function decodeValue(buf: Buffer, offset: number): DecodeResult {
   // Arrays: 0xD0..0xDE inline count, 0xDF = terminated
   if (tag >= TAG_ARRAY_BASE && tag < TAG_ARRAY_BASE + TAG_ARRAY_OVERFLOW) {
     const count = tag - TAG_ARRAY_BASE;
-    return decodeArrayN(buf, offset + 1, count);
+    return decodeArrayN(buf, offset + 1, count, objects);
   }
   if (tag === TAG_ARRAY_BASE + TAG_ARRAY_OVERFLOW) {
-    return decodeArrayTerminated(buf, offset + 1);
+    return decodeArrayTerminated(buf, offset + 1, objects);
   }
 
   // Dicts: 0xE0..0xEE inline count, 0xEF = terminated
   if (tag >= TAG_DICT_BASE && tag < TAG_DICT_BASE + TAG_DICT_OVERFLOW) {
     const count = tag - TAG_DICT_BASE;
-    return decodeDictN(buf, offset + 1, count);
+    return decodeDictN(buf, offset + 1, count, objects);
   }
   if (tag === TAG_DICT_BASE + TAG_DICT_OVERFLOW) {
-    return decodeDictTerminated(buf, offset + 1);
+    return decodeDictTerminated(buf, offset + 1, objects);
   }
 
   throw new Error(`OPACK: unknown tag 0x${tag.toString(16)} at offset ${offset}`);
 }
 
-function decodeArrayN(buf: Buffer, offset: number, count: number): DecodeResult {
+function decodeArrayN(buf: Buffer, offset: number, count: number, objects: OpackValue[]): DecodeResult {
   const arr: OpackValue[] = [];
   for (let i = 0; i < count; i++) {
-    const item = decodeValue(buf, offset);
+    const item = decodeValue(buf, offset, objects);
     arr.push(item.value);
     offset = item.offset;
   }
   return { value: arr, offset };
 }
 
-function decodeArrayTerminated(buf: Buffer, offset: number): DecodeResult {
+function decodeArrayTerminated(buf: Buffer, offset: number, objects: OpackValue[]): DecodeResult {
   const arr: OpackValue[] = [];
   while (offset < buf.length && buf[offset] !== TAG_TERMINATOR) {
-    const item = decodeValue(buf, offset);
+    const item = decodeValue(buf, offset, objects);
     arr.push(item.value);
     offset = item.offset;
   }
@@ -400,24 +437,24 @@ function decodeArrayTerminated(buf: Buffer, offset: number): DecodeResult {
   return { value: arr, offset };
 }
 
-function decodeDictN(buf: Buffer, offset: number, count: number): DecodeResult {
+function decodeDictN(buf: Buffer, offset: number, count: number, objects: OpackValue[]): DecodeResult {
   const dict: OpackDict = new Map();
   for (let i = 0; i < count; i++) {
-    const key = decodeValue(buf, offset);
+    const key = decodeValue(buf, offset, objects);
     offset = key.offset;
-    const val = decodeValue(buf, offset);
+    const val = decodeValue(buf, offset, objects);
     offset = val.offset;
     dict.set(key.value, val.value);
   }
   return { value: dict, offset };
 }
 
-function decodeDictTerminated(buf: Buffer, offset: number): DecodeResult {
+function decodeDictTerminated(buf: Buffer, offset: number, objects: OpackValue[]): DecodeResult {
   const dict: OpackDict = new Map();
   while (offset < buf.length && buf[offset] !== TAG_TERMINATOR) {
-    const key = decodeValue(buf, offset);
+    const key = decodeValue(buf, offset, objects);
     offset = key.offset;
-    const val = decodeValue(buf, offset);
+    const val = decodeValue(buf, offset, objects);
     offset = val.offset;
     dict.set(key.value, val.value);
   }
