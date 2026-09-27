@@ -15,18 +15,13 @@ export function encodeVarint(value: number): Buffer {
 
 export function decodeVarint(buf: Buffer, offset = 0): { value: number; bytesRead: number } {
   let value = 0;
-  let shift = 0;
-  let bytesRead = 0;
-
-  while (offset + bytesRead < buf.length) {
+  for (let bytesRead = 0; bytesRead < 5 && offset + bytesRead < buf.length; bytesRead++) {
     const byte = buf[offset + bytesRead];
-    value |= (byte & 0x7f) << shift;
-    bytesRead++;
-    if ((byte & 0x80) === 0) break;
-    shift += 7;
+    value += (byte & 0x7f) * 2 ** (7 * bytesRead);
+    if (value > 0xffffffff) throw new Error('DataStream length overflow');
+    if ((byte & 0x80) === 0) return { value, bytesRead: bytesRead + 1 };
   }
-
-  return { value, bytesRead };
+  throw new Error('Incomplete DataStream length');
 }
 
 // --- DataStream 32-byte header framing ---
@@ -77,6 +72,8 @@ export function buildDataStreamFrame(protobufData: Buffer): Buffer {
 export interface ParsedDataStreamFrame {
   messageType: 'sync' | 'rply';
   protobufData: Buffer | null;  // null for rply frames with no data
+  /** Every message in wire order; protobufData retains the first for compatibility. */
+  protobufMessages: Buffer[];
   seqno: bigint;
   totalSize: number;
 }
@@ -85,6 +82,7 @@ export function parseDataStreamFrame(buf: Buffer, offset = 0): ParsedDataStreamF
   if (buf.length - offset < HEADER_SIZE) return null;
 
   const totalSize = buf.readUInt32BE(offset);
+  if (totalSize < HEADER_SIZE) throw new Error('Invalid DataStream frame size');
   if (buf.length - offset < totalSize) return null;
 
   const messageTypeStr = buf.subarray(offset + 4, offset + 8).toString('ascii');
@@ -92,28 +90,28 @@ export function parseDataStreamFrame(buf: Buffer, offset = 0): ParsedDataStreamF
   const seqno = buf.readBigUInt64BE(offset + 20);
 
   if (totalSize <= HEADER_SIZE) {
-    return { messageType, protobufData: null, seqno, totalSize };
+    return { messageType, protobufData: null, protobufMessages: [], seqno, totalSize };
   }
 
   const plistBuf = buf.subarray(offset + HEADER_SIZE, offset + totalSize);
 
-  try {
-    const parsed = parseBuffer(plistBuf);
-    const payload = parsed[0] as Record<string, unknown>;
-    const params = payload?.params as Record<string, unknown> | undefined;
-    const data = params?.data as Buffer | undefined;
-
-    if (!data) {
-      // Empty payload (e.g., rply with just {})
-      return { messageType, protobufData: null, seqno, totalSize };
+  const parsed = parseBuffer(plistBuf);
+  const payload = parsed[0] as Record<string, unknown>;
+  const params = payload?.params as Record<string, unknown> | undefined;
+  const data = params?.data;
+  const protobufMessages: Buffer[] = [];
+  if (data !== undefined) {
+    if (!Buffer.isBuffer(data)) throw new Error('Invalid DataStream protobuf payload');
+    let cursor = 0;
+    while (cursor < data.length) {
+      const { value: length, bytesRead } = decodeVarint(data, cursor);
+      cursor += bytesRead;
+      if (length > data.length - cursor) throw new Error('Truncated DataStream protobuf');
+      protobufMessages.push(data.subarray(cursor, cursor + length));
+      cursor += length;
     }
-
-    const { value: protoLength, bytesRead } = decodeVarint(data, 0);
-    const protobufData = data.subarray(bytesRead, bytesRead + protoLength);
-    return { messageType, protobufData, seqno, totalSize };
-  } catch {
-    return { messageType, protobufData: null, seqno, totalSize };
   }
+  return { messageType, protobufData: protobufMessages[0] ?? null, protobufMessages, seqno, totalSize };
 }
 
 /** Build a "rply" frame to acknowledge a received sync frame */

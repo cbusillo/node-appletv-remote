@@ -292,6 +292,31 @@ pyatv fixtures verify both encryption and streaming reception of these frames.
 The compatibility tests include independent fixtures from pyatv 0.18.0 and the
 [published OPACK protocol examples](https://pyatv.dev/documentation/protocols/#opack).
 
+### AirPlay metadata compatibility
+
+DataStream frames can carry several length-prefixed protobufs. The receive path
+delivers all of them in wire order, including across encrypted TCP fragments.
+`parseDataStreamFrame` retains the first message as `protobufData` for compatibility
+and exposes the complete `protobufMessages` array. Malformed lengths fail instead
+of silently truncating packets or preventing parser progress.
+
+The metadata schema includes volume/capability updates, active player selection,
+client/player removal, grouped outputs and cluster identity. `MRPMessage` and
+`MessageType` are public exports for decoded-message consumers and codec tests.
+Untyped acknowledgements have type zero rather than appearing as media commands.
+The metadata fixtures come from locked pyatv encoders using synthetic data only.
+The receive-path regression verifies a fragmented encrypted pair of batches.
+
+Correlated read-only volume queries use `MRPMessage.getVolume(outputDeviceUID)`
+and reply type `MessageType.GetVolumeResult`. Missing result fields remain absent;
+they are not interpreted as zero. Callers must bind a result to the output
+generation that issued the request, since the reply itself has no output ID.
+
+These extensions do not provide a complete player-state reducer or qualify the
+long-lived AirPlay transport. Consumers must track explicit active player/output
+selection and invalidate feedback on connection loss. Data/event socket loss is
+forwarded through the connection's existing error/close events.
+
 ```bash
 # Install dependencies
 npm install

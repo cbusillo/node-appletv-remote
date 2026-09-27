@@ -8,7 +8,9 @@ export class Message {
   readonly payload: Record<string, unknown>;
 
   constructor(decoded: Record<string, unknown>) {
-    this.type = (decoded.type as MessageType) ?? 0;
+    // protobufjs supplies the first enum member for an absent proto2 field.
+    // An untyped acknowledgement must not appear to be a SendCommand.
+    this.type = Object.hasOwn(decoded, 'type') ? decoded.type as MessageType : 0;
     this.identifier = (decoded.identifier as string) ?? '';
     this.payload = decoded;
   }

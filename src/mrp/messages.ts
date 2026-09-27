@@ -2,11 +2,16 @@ import protobuf from 'protobufjs';
 import { fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
 import { dirname, join } from 'node:path';
+import { existsSync } from 'node:fs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const PROTO_DIR = join(__dirname, '..', 'proto');
+// Single-file application bundles keep the packaged schemas next to their entry.
+const PROTO_DIR = existsSync(join(__dirname, 'proto'))
+  ? join(__dirname, 'proto')
+  : join(__dirname, '..', 'proto');
 
 export enum MessageType {
+  Unknown = 0,
   SendCommand = 1,
   SendCommandResult = 2,
   GetState = 3,
@@ -47,8 +52,15 @@ export enum MessageType {
   GenericMessage = 42,
   SendButtonEvent = 43,
   SetNowPlayingClient = 46,
+  SetNowPlayingPlayer = 47,
+  GetVolume = 49,
+  GetVolumeResult = 50,
+  VolumeDidChange = 52,
+  RemoveClient = 53,
+  RemovePlayer = 54,
   UpdateClient = 55,
   UpdateContentItem = 56,
+  VolumeControlCapabilitiesDidChange = 64,
 }
 
 let rootPromise: Promise<protobuf.Root> | null = null;
@@ -74,6 +86,13 @@ const PROTO_FILES = [
   'SetConnectionStateMessage.proto',
   'SetHiliteModeMessage.proto',
   'SetNowPlayingClientMessage.proto',
+  'SetNowPlayingPlayerMessage.proto',
+  'GetVolumeMessage.proto',
+  'GetVolumeResultMessage.proto',
+  'VolumeDidChangeMessage.proto',
+  'VolumeControlCapabilitiesDidChangeMessage.proto',
+  'RemoveClientMessage.proto',
+  'RemovePlayerMessage.proto',
   'PlaybackQueueRequestMessage.proto',
   'TransactionMessage.proto',
   'UpdateClientMessage.proto',
@@ -163,6 +182,16 @@ async function encodeMessage(
 }
 
 export class MRPMessage {
+  /** Read the current level for one authenticated output without changing it. */
+  static async getVolume(outputDeviceUID: string): Promise<Buffer> {
+    if (!outputDeviceUID) throw new TypeError('An output device identifier is required');
+    return encodeMessage(MessageType.GetVolume, {
+      key: '.getVolumeMessage',
+      typeName: 'GetVolumeMessage',
+      fields: { outputDeviceUID },
+    });
+  }
+
   static async deviceInfo(options: DeviceInfoOptions): Promise<Buffer> {
     return encodeMessage(MessageType.DeviceInfo, {
       key: '.deviceInfoMessage',

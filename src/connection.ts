@@ -390,8 +390,8 @@ export class AirPlayConnection extends EventEmitter {
       this.eventSocket = await connectSocket(this.host, eventPort);
       this.log('event socket connected');
       this.eventSocket.on('data', (data) => this.onEventChannelData(Buffer.from(data)));
-      this.eventSocket.on('error', (err) => this.log(`event channel error: ${err.message}`));
-      this.eventSocket.on('close', () => this.log('event channel closed'));
+      this.eventSocket.on('error', (err) => this.emit('error', err));
+      this.eventSocket.on('close', () => this.emit('close'));
     }
   }
 
@@ -455,8 +455,8 @@ export class AirPlayConnection extends EventEmitter {
     this.log('data socket connected');
 
     this.dataSocket.on('data', (data) => this.onDataChannelData(Buffer.from(data)));
-    this.dataSocket.on('error', (err) => this.log(`data channel error: ${err.message}`));
-    this.dataSocket.on('close', () => this.log('data channel closed by remote'));
+    this.dataSocket.on('error', (err) => this.emit('error', err));
+    this.dataSocket.on('close', () => this.emit('close'));
     this.dataSocket.on('end', () => this.log('data channel ended by remote'));
 
     // Initialize MRP protocol on data channel
@@ -471,10 +471,8 @@ export class AirPlayConnection extends EventEmitter {
       uniqueIdentifier: this.credentials.clientId,
       name: 'Node ATV Remote',
     });
-    await this.sendMRPMessage(deviceInfo);
-
     // Wait for DeviceInfo response from Apple TV
-    await this.waitForMRPMessage(MessageType.DeviceInfo, 5000);
+    await this.sendMRPMessageAndWait(deviceInfo, MessageType.DeviceInfo, 5000);
     this.log('DeviceInfo exchange complete');
 
     // 2. CryptoPairing is NOT performed over AirPlay transport.
@@ -492,6 +490,7 @@ export class AirPlayConnection extends EventEmitter {
       nowPlayingUpdates: true,
       volumeUpdates: true,
       keyboardUpdates: true,
+      outputDeviceUpdates: true,
     });
     await this.sendMRPMessage(updatesConfig);
 
@@ -749,13 +748,22 @@ export class AirPlayConnection extends EventEmitter {
         this.dataDecBuffer = Buffer.concat([this.dataDecBuffer, decrypted]);
       } catch (e) {
         this.log(`data channel decrypt error: ${e}`);
+        this.close();
+        this.emit('error', new Error('Invalid AirPlay data encryption'));
         return;
       }
     }
 
     // Parse complete DataStream frames from the decrypted buffer
     while (this.dataDecBuffer.length >= 32) {
-      const frame = parseDataStreamFrame(this.dataDecBuffer, 0);
+      let frame;
+      try {
+        frame = parseDataStreamFrame(this.dataDecBuffer, 0);
+      } catch {
+        this.close();
+        this.emit('error', new Error('Invalid AirPlay data frame'));
+        return;
+      }
       if (!frame) break;
 
       // Send rply for sync frames from the Apple TV
@@ -765,8 +773,8 @@ export class AirPlayConnection extends EventEmitter {
         this.dataSocket?.write(encrypted);
       }
 
-      if (frame.protobufData) {
-        this.handleMRPResponse(frame.protobufData);
+      for (const protobufData of frame.protobufMessages) {
+        void this.handleMRPResponse(protobufData);
       }
 
       // Advance buffer past this frame

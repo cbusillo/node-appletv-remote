@@ -1,4 +1,5 @@
 import { describe, it, expect } from 'vitest';
+import bplistCreator from 'bplist-creator';
 import { encodeVarint, decodeVarint, buildDataStreamFrame, parseDataStreamFrame } from '../data-stream.js';
 
 describe('varint encoding', () => {
@@ -31,6 +32,45 @@ describe('varint encoding', () => {
 });
 
 describe('DataStream framing', () => {
+  function batchFrame(messages: Buffer[]): Buffer {
+    const payload = bplistCreator({ params: { data: Buffer.concat(messages.map(message =>
+      Buffer.concat([encodeVarint(message.length), message]),
+    )) } });
+    const header = buildDataStreamFrame(Buffer.alloc(0)).subarray(0, 32);
+    header.writeUInt32BE(32 + payload.length);
+    return Buffer.concat([header, payload]);
+  }
+
+  it('preserves every protobuf in a batch, in order', () => {
+    const messages = [Buffer.from([8, 15]), Buffer.from([8, 17]), Buffer.from([8, 4])];
+    const frame = batchFrame(messages);
+    expect(parseDataStreamFrame(frame)?.protobufMessages).toEqual(messages);
+    expect(parseDataStreamFrame(frame)?.protobufData).toEqual(messages[0]);
+  });
+
+  it('waits for the complete frame without dropping a fragmented batch', () => {
+    const frame = batchFrame([Buffer.from([8, 15]), Buffer.from([8, 17])]);
+    for (let length = 0; length < frame.length; length++) {
+      expect(parseDataStreamFrame(frame.subarray(0, length))).toBeNull();
+    }
+    expect(parseDataStreamFrame(frame)?.protobufMessages).toHaveLength(2);
+  });
+
+  it('rejects impossible frame sizes instead of making no forward progress', () => {
+    const frame = buildDataStreamFrame(Buffer.from([8, 15]));
+    frame.writeUInt32BE(0);
+    expect(() => parseDataStreamFrame(frame)).toThrow(/size/i);
+  });
+
+  it('rejects truncated protobufs and unterminated length prefixes', () => {
+    for (const data of [Buffer.from([3, 8, 15]), Buffer.from([0x80])]) {
+      const payload = bplistCreator({ params: { data } });
+      const header = buildDataStreamFrame(Buffer.alloc(0)).subarray(0, 32);
+      header.writeUInt32BE(32 + payload.length);
+      expect(() => parseDataStreamFrame(Buffer.concat([header, payload]))).toThrow();
+    }
+  });
+
   it('builds a frame with a 32-byte header', () => {
     const data = Buffer.from([0x08, 0x01]); // minimal protobuf
     const frame = buildDataStreamFrame(data);
