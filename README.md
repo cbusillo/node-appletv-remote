@@ -312,6 +312,18 @@ and reply type `MessageType.GetVolumeResult`. Missing result fields remain absen
 they are not interpreted as zero. Callers must bind a result to the output
 generation that issued the request, since the reply itself has no output ID.
 
+`MRPMessage.setSystemAudioOutputs(outputDeviceUIDs)` encodes a
+`ModifyOutputContextRequestMessage` with the `SharedSystemAudio` context and the
+UIDs in both `settingDevices` and `clusterAwareSettingDevices`. This context selects
+personal outputs such as same-account AirPods; `SharedAudioPresentation` is the
+AirPlay speaker-group context. The device's reply is only an acknowledgement, so
+confirm the route from later reported output devices. The acknowledgement can be
+slow while tvOS takes AirPods over from another device; wait for it with
+`sendMRPMessageAndWait(request, undefined, timeoutMs, { fatalTimeout: false })` so a
+late or missing acknowledgement rejects only that wait instead of closing the
+connection. Other requests keep the default fatal timeout. Context values follow the
+MediaRemote enum recorded in pyatv#2834, and the fixtures come from pyatv 0.18.0.
+
 Consumers must track explicit active player/output selection and invalidate
 feedback on connection loss; these extensions do not provide a complete reducer.
 

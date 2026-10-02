@@ -53,6 +53,7 @@ export enum MessageType {
   SendButtonEvent = 43,
   SetNowPlayingClient = 46,
   SetNowPlayingPlayer = 47,
+  ModifyOutputContextRequest = 48,
   GetVolume = 49,
   GetVolumeResult = 50,
   VolumeDidChange = 52,
@@ -93,6 +94,7 @@ const PROTO_FILES = [
   'VolumeControlCapabilitiesDidChangeMessage.proto',
   'RemoveClientMessage.proto',
   'RemovePlayerMessage.proto',
+  'ModifyOutputContextRequestMessage.proto',
   'PlaybackQueueRequestMessage.proto',
   'TransactionMessage.proto',
   'UpdateClientMessage.proto',
@@ -181,7 +183,45 @@ async function encodeMessage(
   return Buffer.from(ProtocolMessage.encode(message).finish());
 }
 
+/** Output context types reported by tvOS MediaRemote (values from pyatv#2834). */
+export enum OutputContextType {
+  Unknown = 0,
+  SharedAudioPresentation = 1,
+  SharedSystemAudio = 2,
+  SharedSystemScreen = 3,
+  iTunesAudio = 4,
+  Auxiliary = 5,
+}
+
 export class MRPMessage {
+  /**
+   * Replace the system audio route with the given output device UIDs.
+   *
+   * Uses the SharedSystemAudio output context, which selects personal outputs such
+   * as same-account AirPods. SharedAudioPresentation is the AirPlay speaker-group
+   * context and does not reliably select them. The reply is only an acknowledgement;
+   * confirm the route from the reported output devices.
+   */
+  static async setSystemAudioOutputs(outputDeviceUIDs: readonly string[]): Promise<Buffer> {
+    if (
+      !Array.isArray(outputDeviceUIDs) ||
+      outputDeviceUIDs.length === 0 ||
+      !outputDeviceUIDs.every((uid) => typeof uid === 'string' && uid.length > 0) ||
+      new Set(outputDeviceUIDs).size !== outputDeviceUIDs.length
+    )
+      throw new TypeError('One or more distinct output device identifiers are required');
+    const devices = [...outputDeviceUIDs];
+    return encodeMessage(MessageType.ModifyOutputContextRequest, {
+      key: '.modifyOutputContextRequestMessage',
+      typeName: 'ModifyOutputContextRequestMessage',
+      fields: {
+        type: OutputContextType.SharedSystemAudio,
+        settingDevices: devices,
+        clusterAwareSettingDevices: devices,
+      },
+    });
+  }
+
   /** Read the current level for one authenticated output without changing it. */
   static async getVolume(outputDeviceUID: string): Promise<Buffer> {
     if (!outputDeviceUID) throw new TypeError('An output device identifier is required');

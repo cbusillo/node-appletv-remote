@@ -12,7 +12,7 @@ export { Credentials, parseCredentials } from './credentials.js';
 export { NowPlayingInfo, PlaybackState } from './now-playing-info.js';
 export { SupportedCommand, Command } from './supported-command.js';
 export { Message } from './message.js';
-export { MRPMessage, MessageType } from './mrp/messages.js';
+export { MRPMessage, MessageType, OutputContextType } from './mrp/messages.js';
 export { AirPlayConnection } from './connection.js';
 export type { AirPlayConnectionOptions } from './connection.js';
 export type { HAPCredentials } from './auth/types.js';

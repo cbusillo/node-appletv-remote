@@ -855,10 +855,16 @@ export class AirPlayConnection extends EventEmitter {
     }, 2000);
   }
 
+  /**
+   * Send one MRP message and wait for its correlated reply. A timeout fails the connection
+   * unless `fatalTimeout: false` is given; then only this request rejects and a late reply
+   * is ignored. Use that for requests whose acknowledgement may be slow or absent.
+   */
   async sendMRPMessageAndWait(
     protobufData: Buffer,
     responseType?: number,
     timeoutMs = 5000,
+    options: { fatalTimeout?: boolean } = {},
   ): Promise<Record<string, unknown>> {
     this.assertOpen();
     if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) throw new RangeError('Invalid MRP timeout');
@@ -867,7 +873,9 @@ export class AirPlayConnection extends EventEmitter {
     const identifier = Object.hasOwn(message, 'identifier') ? message.identifier : undefined;
     if (!identifier && responseType === undefined) throw new Error('MRP request needs an identifier or response type');
     const key = identifier ? `mrp:id:${identifier}` : `mrp:type:${responseType}`;
-    const response = this.pending.create<Record<string, unknown>>(key, timeoutMs);
+    const response = this.pending.create<Record<string, unknown>>(key, timeoutMs, {
+      fatalTimeout: options.fatalTimeout,
+    });
     this.mrpResponseTypes.set(key, responseType);
     try {
       const [, result] = await Promise.all([this.sendMRPMessage(protobufData), response]);

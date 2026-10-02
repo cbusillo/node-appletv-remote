@@ -169,6 +169,29 @@ describe('AirPlay response transport', () => {
     expect(result.error?.message).toMatch(/MRP.*6/);
   });
 
+  it('fails only the request on a non-fatal MRP timeout and ignores its late reply', async () => {
+    const f = fixture();
+    const request = await MRPMessage.setSystemAudioOutputs(['synthetic-output']);
+    const decoded = await MRPMessage.decode(request);
+    const messages: Record<string, unknown>[] = [];
+    f.connection.on('mrp-message', message => messages.push(message));
+    const result = await outcome(f.connection.sendMRPMessageAndWait(request, undefined, 20, { fatalTimeout: false }));
+    expect(result.error?.message).toMatch(/timed out/i);
+    expect(f.errors).toEqual([]);
+    expect(f.destroyed()).toBe(0);
+    const id = Buffer.from(decoded.identifier as string);
+    f.transport.onDataChannelData(f.peer.encrypt(buildDataStreamFrame(Buffer.concat([Buffer.from([18, id.length]), id]))));
+    await delay(10);
+    expect(messages).toHaveLength(1);
+    expect(f.errors).toEqual([]);
+    const followUp = await MRPMessage.sendCommand(MessageType.GetState);
+    const fatal = await outcome(f.connection.sendMRPMessageAndWait(followUp, MessageType.SetState, 20));
+    expect(fatal.error?.message).toMatch(/timed out/i);
+    expect(f.errors.map(error => error.message)).toEqual([expect.stringMatching(/timed out/i)]);
+    expect(f.destroyed()).toBeGreaterThan(0);
+    f.connection.close();
+  });
+
   it('keeps simultaneous same-type MRP requests separate', async () => {
     const f = fixture();
     const requests = await Promise.all([MRPMessage.sendCommand(MessageType.GetState), MRPMessage.sendCommand(MessageType.GetState)]);
