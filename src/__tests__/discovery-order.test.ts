@@ -1,3 +1,4 @@
+/** Tests that scan() pairs AirPlay and Companion mDNS records regardless of arrival or address order. */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { scan } from '../discovery.js';
 
@@ -32,4 +33,17 @@ describe('mDNS service ordering', () => {
       expect(mock.destroyed).toHaveBeenCalledOnce();
     });
   }
+
+  it('finds the Companion port when a multihomed TV lists its addresses in a different order', async () => {
+    const pending = scan({ timeout: 10 });
+    mock.callbacks.get('airplay')!({
+      name: 'Synthetic TV', host: 'synthetic-tv.local', addresses: ['192.0.2.10', '192.0.2.11'], port: 7000,
+      txt: { deviceid: 'synthetic-tv', model: 'AppleTV6,2' },
+    });
+    mock.callbacks.get('companion-link')!({
+      host: 'synthetic-tv.local', addresses: ['192.0.2.11', '192.0.2.10'], port: 49153,
+    });
+    await vi.advanceTimersByTimeAsync(10);
+    expect((await pending)[0].companionPort).toBe(49153);
+  });
 });

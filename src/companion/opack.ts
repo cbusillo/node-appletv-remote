@@ -283,6 +283,10 @@ function decodeValue(buf: Buffer, offset: number, context: DecodeContext): Decod
   }
 
   const result = decodeLiteral(buf, offset, context);
+  // subarray clamps a short read, so a literal claiming more bytes than remain would decode truncated.
+  if (result.offset > buf.length) {
+    throw new Error('OPACK: unexpected end of buffer');
+  }
   const value = result.value;
   // Deduplicate by encoded bytes, as the encoder does, so equal values with different
   // encodings (int 100 vs float 100.0, UUID vs data) keep separate reference slots.

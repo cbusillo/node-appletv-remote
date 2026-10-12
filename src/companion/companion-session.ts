@@ -33,13 +33,17 @@ export class CompanionSession {
    * Returns a complete frame: 4-byte header + ciphertext + 16-byte auth tag.
    */
   encrypt(frameType: FrameType, plaintext: Buffer): Buffer {
-    const nonce = companionNonce(this.outCounter);
-    this.outCounter++;
-
-    // Build the frame header (used as AAD)
+    // Build the frame header (used as AAD) before advancing the counter, so an
+    // oversized payload throws without desynchronizing the nonce with the peer.
     const header = Buffer.alloc(4);
     header[0] = frameType;
+    if (plaintext.length + AUTH_TAG_LENGTH > 0xffffff) {
+      throw new RangeError('Companion payload too large for a 3-byte frame length');
+    }
     header.writeUIntBE(plaintext.length + AUTH_TAG_LENGTH, 1, 3);
+
+    const nonce = companionNonce(this.outCounter);
+    this.outCounter++;
 
     const { ciphertext, tag } = encryptChaCha20(
       this.outKey,

@@ -44,6 +44,13 @@ describe('CompanionSession', () => {
     }
   });
 
+  it('rejects an oversized payload without consuming a send nonce', () => {
+    const { sender, receiver } = createSessionPair();
+    expect(() => sender.encrypt(FrameType.E_OPACK, Buffer.alloc(0xffffff))).toThrow(/too large/);
+    const encrypted = sender.encrypt(FrameType.E_OPACK, Buffer.from('after'));
+    expect(receiver.decrypt(encrypted.subarray(0, 4), encrypted.subarray(4))).toEqual(Buffer.from('after'));
+  });
+
   it('fails to decrypt with wrong key', () => {
     const key1 = generateRandomBytes(32);
     const key2 = generateRandomBytes(32);

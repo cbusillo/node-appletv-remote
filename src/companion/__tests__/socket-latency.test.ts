@@ -1,3 +1,4 @@
+/** Tests that the Companion socket sends small touch and key events without TCP batching delay. */
 import { createServer, Socket } from 'node:net';
 import { expect, it, vi } from 'vitest';
 import { CompanionConnection } from '../connection.js';

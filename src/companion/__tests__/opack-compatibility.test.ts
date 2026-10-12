@@ -87,6 +87,9 @@ describe('Companion OPACK compatibility', () => {
     expect(opackDecode(uuidAndData)).toEqual([bytes, bytes, bytes]);
   });
 
+  it.each(['4361', '6103', '9203006162', 'd2'])('rejects truncated literal %s', hex =>
+    expect(() => opackDecode(Buffer.from(hex, 'hex'))).toThrow(/end of buffer/));
+
   it.each([1, 2, 3, 4])('decodes an extended reference with %s index bytes', width => {
     const pointer = Buffer.alloc(1 + width);
     pointer[0] = 0xc0 + width;

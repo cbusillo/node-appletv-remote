@@ -289,6 +289,11 @@ object references in device replies.
 Encrypted Companion frame lengths include their authentication tag. Independent
 pyatv fixtures verify both encryption and streaming reception of these frames.
 
+Companion request IDs stay in 1..127. A timed-out request keeps its ID reserved for
+30 seconds, or until its late reply arrives, so the reply cannot resolve a newer request.
+`sendCompanionMessage` never runs out of IDs, but throws if you pass an `_x` that a
+pending request is using. Empty frames are passed through unencrypted, as on the wire.
+
 The compatibility tests include independent fixtures from pyatv 0.18.0 and the
 [published OPACK protocol examples](https://pyatv.dev/documentation/protocols/#opack).
 
