@@ -31,6 +31,9 @@ const TAG_TERMINATOR = 0x03;
 // UUID: 0x05 + 16 raw bytes
 const TAG_UUID = 0x05;
 
+// Minus one: Apple encodes -1 as 0x07, the slot before the small integers.
+const TAG_MINUS_ONE = 0x07;
+
 // Small integers: 0x08 + value, for values 0..39
 const TAG_SMALL_INT_BASE = 0x08;
 const TAG_SMALL_INT_MAX_VALUE = 0x27; // 39
@@ -311,6 +314,10 @@ function decodeLiteral(buf: Buffer, offset: number, objects: OpackValue[]): Deco
   // UUID (16 bytes)
   if (tag === TAG_UUID) {
     return { value: Buffer.from(buf.subarray(offset + 1, offset + 17)), offset: offset + 17 };
+  }
+
+  if (tag === TAG_MINUS_ONE) {
+    return { value: -1, offset: offset + 1 };
   }
 
   // Small integers 0..39: tags 0x08..0x2F

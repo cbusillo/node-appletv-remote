@@ -53,6 +53,9 @@ function ed25519PrivateKeyFromSeed(seed: Buffer): KeyObject {
   });
 }
 
+/** Largest request ID an Apple TV echoes unchanged (one-byte OPACK integers are signed). */
+const MAX_TRANSFER_ID = 127;
+
 export class CompanionConnection extends EventEmitter {
   private socket: Socket | undefined;
   private session: CompanionSession | undefined;
@@ -255,7 +258,7 @@ export class CompanionConnection extends EventEmitter {
       throw new Error('Companion not connected');
     }
 
-    const tid = this.transferId++;
+    const tid = this.nextTransferId();
     content.set('_i', identifier);
     content.set('_x', tid);
 
@@ -283,6 +286,20 @@ export class CompanionConnection extends EventEmitter {
   }
 
   /**
+   * Apple TVs read one-byte OPACK integers as signed, so an ID from 128 to 255 comes back
+   * changed (255 returns as -1) and its reply never matches. Keep IDs in 1..127, skipping
+   * any still awaiting a reply.
+   */
+  private nextTransferId(): number {
+    for (let attempt = 0; attempt < MAX_TRANSFER_ID; attempt++) {
+      const id = this.transferId;
+      this.transferId = id >= MAX_TRANSFER_ID ? 1 : id + 1;
+      if (!this.pendingRequests.has(id)) return id;
+    }
+    throw new Error('Companion has no free request ID');
+  }
+
+  /**
    * Send an OPACK message without waiting for a response.
    */
   sendMessage(identifier: string, content: OpackDict): void {
@@ -291,7 +308,7 @@ export class CompanionConnection extends EventEmitter {
     }
 
     content.set('_i', identifier);
-    if (!content.has('_x')) content.set('_x', this.transferId++);
+    if (!content.has('_x')) content.set('_x', this.nextTransferId());
     const payload = opackEncode(content);
     const encrypted = this.session.encrypt(FrameType.E_OPACK, payload);
     this.writeRaw(encrypted);

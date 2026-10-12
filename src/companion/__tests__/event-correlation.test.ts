@@ -26,6 +26,40 @@ function fixture() {
 }
 
 describe('Companion request and event correlation', () => {
+  it('keeps request IDs in 1..127 so a signed one-byte echo still matches', async () => {
+    const { connection, requests, receive } = fixture();
+    try {
+      for (let n = 0; n < 300; n++) {
+        const pending = connection.sendRequest('_ping', new Map<OpackValue, OpackValue>([['_t', 2], ['_c', new Map()]]));
+        const id = requests.at(-1)!.get('_x') as number;
+        expect(id).toBeGreaterThanOrEqual(1);
+        expect(id).toBeLessThanOrEqual(127);
+        receive(new Map<OpackValue, OpackValue>([['_x', id], ['_t', 3], ['_c', new Map()]]));
+        await pending;
+      }
+      expect(requests.map((r) => r.get('_x')).slice(125, 129)).toEqual([126, 127, 1, 2]);
+    } finally {
+      connection.close();
+    }
+  });
+
+  it('skips a request ID that is still awaiting its reply', async () => {
+    const { connection, requests, receive } = fixture();
+    try {
+      const held = connection.sendRequest('_held', new Map<OpackValue, OpackValue>([['_t', 2], ['_c', new Map()]]));
+      held.catch(() => {});
+      expect(requests[0].get('_x')).toBe(1);
+      for (let n = 0; n < 127; n++) {
+        const pending = connection.sendRequest('_ping', new Map<OpackValue, OpackValue>([['_t', 2], ['_c', new Map()]]));
+        receive(new Map<OpackValue, OpackValue>([['_x', requests.at(-1)!.get('_x')!], ['_t', 3], ['_c', new Map()]]));
+        await pending;
+      }
+      expect(requests.at(-1)!.get('_x')).toBe(2);
+    } finally {
+      connection.close();
+    }
+  });
+
   it('delivers an event with a colliding ID without resolving the pending request', async () => {
     const { connection, requests, receive } = fixture();
     const events: unknown[] = [];
