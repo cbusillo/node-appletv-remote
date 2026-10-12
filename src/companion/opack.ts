@@ -284,11 +284,11 @@ function decodeValue(buf: Buffer, offset: number, context: DecodeContext): Decod
 
   const result = decodeLiteral(buf, offset, context);
   const value = result.value;
-  // Keep reference order separate from membership; preserve byte equality and Object.is(-0, 0).
+  // Deduplicate by encoded bytes, as the encoder does, so equal values with different
+  // encodings (int 100 vs float 100.0, UUID vs data) keep separate reference slots.
+  // ponytail: latin1 key copies each literal once; switch to length-bucketed Buffer.equals if large replies get hot.
   if (result.offset - offset > 1 && !Array.isArray(value) && !(value instanceof Map)) {
-    const key = Buffer.isBuffer(value)
-      ? `buffer:${value.toString('hex')}`
-      : `${typeof value}:${Object.is(value, -0) ? '-0' : String(value)}`;
+    const key = buf.toString('latin1', offset, result.offset);
     if (!seen.has(key)) {
       seen.add(key);
       objects.push(value);

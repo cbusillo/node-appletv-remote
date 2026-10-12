@@ -73,6 +73,20 @@ describe('Companion OPACK compatibility', () => {
     expect(opackDecode(packet)).toEqual([0, -0, 0, bytes, bytes, 'end', 'end']);
   });
 
+  it('gives equal values with different encodings separate reference slots, as the encoder does', () => {
+    // int8 100, float64 100.0, then a reference to slot 1 (the float).
+    const numbers = Buffer.concat([
+      Buffer.from('d33064', 'hex'), opackEncode(new OpackFloat(100)), Buffer.from('a1', 'hex'),
+    ]);
+    expect(opackDecode(numbers)).toEqual([100, 100, 100]);
+    // A UUID and a 16-byte data value with the same bytes, then a reference to slot 1 (the data).
+    const bytes = Buffer.alloc(16, 0xab);
+    const uuidAndData = Buffer.concat([
+      Buffer.from('d305', 'hex'), bytes, Buffer.from('80', 'hex'), bytes, Buffer.from('a1', 'hex'),
+    ]);
+    expect(opackDecode(uuidAndData)).toEqual([bytes, bytes, bytes]);
+  });
+
   it.each([1, 2, 3, 4])('decodes an extended reference with %s index bytes', width => {
     const pointer = Buffer.alloc(1 + width);
     pointer[0] = 0xc0 + width;
