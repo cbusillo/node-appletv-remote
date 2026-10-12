@@ -64,6 +64,15 @@ describe('Companion OPACK compatibility', () => {
     expect(opackDecode(Buffer.from('d543666f6f43666f6fa043626172a1', 'hex')))
       .toEqual(['foo', 'foo', 'foo', 'bar', 'bar']));
 
+  it('preserves signed zero and byte-based deduplication in reference order', () => {
+    const bytes = Buffer.from([0xab]);
+    const literals = [new OpackFloat(0), new OpackFloat(-0), new OpackFloat(0), bytes, bytes, 'end'];
+    const packet = Buffer.concat([
+      Buffer.from([0xd7]), ...literals.map(opackEncode), Buffer.from([0xa3]),
+    ]);
+    expect(opackDecode(packet)).toEqual([0, -0, 0, bytes, bytes, 'end', 'end']);
+  });
+
   it.each([1, 2, 3, 4])('decodes an extended reference with %s index bytes', width => {
     const pointer = Buffer.alloc(1 + width);
     pointer[0] = 0xc0 + width;

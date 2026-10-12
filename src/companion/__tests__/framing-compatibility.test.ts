@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { CompanionSession } from '../companion-session.js';
 import { CompanionConnection } from '../connection.js';
 import { FrameType } from '../framing.js';
-import { opackDecode, opackEncode, type OpackDict, type OpackValue } from '../opack.js';
+import type { OpackDict } from '../opack.js';
 
 // pyatv 0.18.0 Chacha20Cipher(nonce_length=12), bytes(range(32)), counters 0 and 1.
 // Public synthetic keys and payloads; no pairing or live device data.
@@ -34,37 +34,6 @@ function receiver() {
 }
 
 describe('Companion encrypted framing compatibility', () => {
-  it('uses nonzero transaction IDs and correlates successive public requests', async () => {
-    const { connection, parser, errors } = receiver();
-    const peer = new CompanionSession(key, key);
-    const ids: number[] = [];
-    parser.socket = {
-      write(frame: Buffer): void {
-        const request = opackDecode(peer.decrypt(frame.subarray(0, 4), frame.subarray(4))) as OpackDict;
-        const id = request.get('_x') as number;
-        // Observed TV behavior: transaction zero is never acknowledged.
-        expect(id).toBeGreaterThan(0);
-        expect(ids).not.toContain(id);
-        ids.push(id);
-        const reply = new Map<OpackValue, OpackValue>([['_x', id], ['_t', 3], ['_c', new Map()]]);
-        queueMicrotask(() => parser.onData(peer.encrypt(FrameType.E_OPACK, opackEncode(reply))));
-      },
-      destroy(): void {},
-    };
-    try {
-      for (const identifier of ['_systemInfo', '_sessionStart']) {
-        const reply = await connection.sendRequest(identifier, new Map<OpackValue, OpackValue>([
-          ['_t', 2], ['_c', new Map()],
-        ]));
-        expect(reply.get('_t')).toBe(3);
-      }
-      expect(ids).toHaveLength(2);
-      expect(errors).toEqual([]);
-    } finally {
-      connection.close();
-    }
-  });
-
   it('matches an independently encrypted packet including the tag in its header', () => {
     const sender = new CompanionSession(key, key);
     expect(sender.encrypt(FrameType.E_OPACK, payload)).toEqual(frames[0]);

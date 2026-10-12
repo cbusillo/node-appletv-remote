@@ -79,7 +79,6 @@ export async function scan(options: ScanOptions = {}): Promise<DiscoveredDevice[
             port: service.port,
             deviceId: parsed.deviceId,
             model: parsed.model,
-            companionPort: companionPorts.get(address),
           }),
         );
       }
@@ -94,12 +93,6 @@ export async function scan(options: ScanOptions = {}): Promise<DiscoveredDevice[
         if (!address) return;
 
         companionPorts.set(address, service.port);
-
-        for (const device of devices.values()) {
-          if (device.address === address) {
-            device.companionPort = service.port;
-          }
-        }
       },
     );
 
@@ -109,6 +102,10 @@ export async function scan(options: ScanOptions = {}): Promise<DiscoveredDevice[
       instance.destroy();
 
       let result = Array.from(devices.values());
+      // Join once after both browsers stop, independent of advertisement order.
+      for (const device of result) {
+        device.companionPort = companionPorts.get(device.address);
+      }
       if (options.filter) {
         result = result.filter(options.filter);
       }
