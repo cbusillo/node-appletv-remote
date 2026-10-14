@@ -179,13 +179,14 @@ export const MRP_SCHEMA: Record<string, unknown> = {
         "RepeatMode": {
           "values": {
             "Unknown": 0,
-            "One": 1,
-            "All": 2
+            "Off": 1,
+            "One": 2,
+            "All": 3
           }
         },
         "ShuffleMode": {
           "values": {
-            "Unkown": 0,
+            "Unknown": 0,
             "Off": 1,
             "Albums": 2,
             "Songs": 3
@@ -321,13 +322,14 @@ export const MRP_SCHEMA: Record<string, unknown> = {
         "RepeatMode": {
           "values": {
             "Unknown": 0,
-            "One": 1,
-            "All": 2
+            "Off": 1,
+            "One": 2,
+            "All": 3
           }
         },
         "ShuffleMode": {
           "values": {
-            "Unkown": 0,
+            "Unknown": 0,
             "Off": 1,
             "Albums": 2,
             "Songs": 3
@@ -1113,13 +1115,14 @@ export const MRP_SCHEMA: Record<string, unknown> = {
         "RepeatMode": {
           "values": {
             "Unknown": 0,
-            "One": 1,
-            "All": 2
+            "Off": 1,
+            "One": 2,
+            "All": 3
           }
         },
         "ShuffleMode": {
           "values": {
-            "Unkown": 0,
+            "Unknown": 0,
             "Off": 1,
             "Albums": 2,
             "Songs": 3
@@ -1396,6 +1399,7 @@ export const MRP_SCHEMA: Record<string, unknown> = {
             "SEND_PACKED_VIRTUAL_TOUCH_EVENT_MESSAGE": 43,
             "SET_NOW_PLAYING_CLIENT_MESSAGE": 46,
             "SET_NOW_PLAYING_PLAYER_MESSAGE": 47,
+            "SET_VOLUME_MESSAGE": 51,
             "VOLUME_DID_CHANGE_MESSAGE": 52,
             "REMOVE_CLIENT_MESSAGE": 53,
             "REMOVE_PLAYER_MESSAGE": 54,
@@ -1582,6 +1586,25 @@ export const MRP_SCHEMA: Record<string, unknown> = {
             "Interrupted": 4,
             "Seeking": 5
           }
+        }
+      }
+    },
+    "setVolumeMessage": {
+      "edition": "proto2",
+      "type": "SetVolumeMessage",
+      "id": 55,
+      "extend": "ProtocolMessage"
+    },
+    "SetVolumeMessage": {
+      "edition": "proto2",
+      "fields": {
+        "volume": {
+          "type": "float",
+          "id": 1
+        },
+        "outputDeviceUID": {
+          "type": "string",
+          "id": 2
         }
       }
     },
@@ -1851,6 +1874,29 @@ export const MRP_SCHEMA: Record<string, unknown> = {
         "volumeCapabilities": {
           "type": "int32",
           "id": 2
+        }
+      }
+    },
+    "volumeDidChangeMessage": {
+      "edition": "proto2",
+      "type": "VolumeDidChangeMessage",
+      "id": 56,
+      "extend": "ProtocolMessage"
+    },
+    "VolumeDidChangeMessage": {
+      "edition": "proto2",
+      "fields": {
+        "volume": {
+          "type": "float",
+          "id": 1
+        },
+        "endpointUID": {
+          "type": "string",
+          "id": 2
+        },
+        "outputDeviceUID": {
+          "type": "string",
+          "id": 3
         }
       }
     },
