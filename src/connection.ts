@@ -71,11 +71,20 @@ function parseHTTPMessage(buf: Buffer): ParsedHTTP | null {
   return { headers, body: Buffer.from(body), totalSize };
 }
 
-/** Open a TCP socket to host:port; rejects on the first socket error before connecting. */
-function connectSocket(host: string, port: number): Promise<Socket> {
+/**
+ * Open a TCP socket to host:port with Nagle disabled.
+ * @throws (rejects) on the first socket error, or if not connected within `timeoutMs` (default 5 s).
+ */
+export function connectSocket(host: string, port: number, timeoutMs = 5000): Promise<Socket> {
   return new Promise((resolve, reject) => {
     const sock = new Socket();
-    sock.connect(port, host, () => resolve(sock));
+    // MRP/RTSP messages are small request/response writes; Nagle + delayed ACK would stall them.
+    sock.setNoDelay(true);
+    sock.setTimeout(timeoutMs, () => sock.destroy(new Error(`Connect to ${host}:${port} timed out`)));
+    sock.connect(port, host, () => {
+      sock.setTimeout(0);
+      resolve(sock);
+    });
     sock.once('error', reject);
   });
 }
@@ -116,6 +125,8 @@ export class AirPlayConnection extends EventEmitter {
     private host: string,
     private port: number,
     private credentials: HAPCredentials,
+    /** Pause after the MRP handshake before resolving connect(); see ConnectOptions.settleMs. */
+    private settleMs = 0,
   ) {
     super();
   }
@@ -517,7 +528,7 @@ export class AirPlayConnection extends EventEmitter {
 
   /**
    * MRP handshake on the data channel: DeviceInfo (awaits the reply), SetConnectionState,
-   * ClientUpdatesConfig, GetKeyboardSession, then a 500 ms settle delay.
+   * ClientUpdatesConfig, GetKeyboardSession, then the optional `settleMs` delay (default 0).
    * @throws if the DeviceInfo reply does not arrive within 5 s.
    */
   private async initMRPProtocol(): Promise<void> {
@@ -556,8 +567,9 @@ export class AirPlayConnection extends EventEmitter {
     const getKeyboard = await MRPMessage.sendCommand(MessageType.GetKeyboardSession);
     await this.sendMRPMessage(getKeyboard);
 
-    // Wait a moment for the Apple TV to process init messages and send updates
-    await delay(500);
+    // ponytail: fixed settle, 0 by default (was 500 ms). Replace with waiting for the first
+    // update message if some Apple TV model turns out to drop the first command.
+    if (this.settleMs > 0) await delay(this.settleMs);
   }
 
   /**
