@@ -52,17 +52,23 @@ export interface ScanOptions {
   filter?: (device: DiscoveredDevice) => boolean;
 }
 
+/** Routable IPv4 addresses, in advertised order (link-local 169.254.x.x excluded). */
+function usableAddresses(service: Service): string[] {
+  return (service.addresses ?? []).filter((a) => a.includes('.') && !a.startsWith('169.254'));
+}
+
 export async function scan(options: ScanOptions = {}): Promise<DiscoveredDevice[]> {
   const timeout = options.timeout ?? 5000;
   const devices = new Map<string, DiscoveredDevice>();
+  const companionPorts = new Map<string, number>();
+  const airplayAddresses = new Map<string, string[]>();
 
   return new Promise((resolve) => {
     const instance = new Bonjour();
 
     const browser = instance.find({ type: 'airplay', protocol: 'tcp' }, (service: Service) => {
-      const address = service.addresses?.find(
-        (a) => a.includes('.') && !a.startsWith('169.254'),
-      );
+      const addresses = usableAddresses(service);
+      const address = addresses[0];
       if (!address) return;
 
       const txt = service.txt as Record<string, string>;
@@ -80,21 +86,17 @@ export async function scan(options: ScanOptions = {}): Promise<DiscoveredDevice[
             model: parsed.model,
           }),
         );
+        airplayAddresses.set(key, addresses);
       }
     });
 
     const companionBrowser = instance.find(
       { type: 'companion-link', protocol: 'tcp' },
       (service: Service) => {
-        const address = service.addresses?.find(
-          (a) => a.includes('.') && !a.startsWith('169.254'),
-        );
-        if (!address) return;
-
-        for (const device of devices.values()) {
-          if (device.address === address) {
-            device.companionPort = service.port;
-          }
+        // A multihomed TV may list its addresses in a different order per service,
+        // so index the port under every address rather than only the first.
+        for (const address of usableAddresses(service)) {
+          companionPorts.set(address, service.port);
         }
       },
     );
@@ -105,6 +107,11 @@ export async function scan(options: ScanOptions = {}): Promise<DiscoveredDevice[
       instance.destroy();
 
       let result = Array.from(devices.values());
+      // Join once after both browsers stop, independent of advertisement order.
+      for (const [key, device] of devices) {
+        const match = airplayAddresses.get(key)!.find((a) => companionPorts.has(a));
+        device.companionPort = match === undefined ? undefined : companionPorts.get(match);
+      }
       if (options.filter) {
         result = result.filter(options.filter);
       }

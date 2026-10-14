@@ -22,9 +22,9 @@ describe('CompanionSession', () => {
     // Encrypted output: 4-byte header + ciphertext + 16-byte tag
     const header = encrypted.subarray(0, 4);
     expect(header[0]).toBe(FrameType.E_OPACK);
-    // Length in header should be plaintext length
-    const payloadLen = (header[1] << 16) | (header[2] << 8) | header[3];
-    expect(payloadLen).toBe(plaintext.length);
+    // Header length describes the complete wire payload, including its tag.
+    const payloadLen = header.readUIntBE(1, 3);
+    expect(payloadLen).toBe(encrypted.length - header.length);
 
     const encryptedPayload = encrypted.subarray(4);
     const decrypted = receiver.decrypt(header, encryptedPayload);
@@ -42,6 +42,13 @@ describe('CompanionSession', () => {
       const decrypted = receiver.decrypt(header, payload);
       expect(decrypted).toEqual(msg);
     }
+  });
+
+  it('rejects an oversized payload without consuming a send nonce', () => {
+    const { sender, receiver } = createSessionPair();
+    expect(() => sender.encrypt(FrameType.E_OPACK, Buffer.alloc(0xffffff))).toThrow(/too large/);
+    const encrypted = sender.encrypt(FrameType.E_OPACK, Buffer.from('after'));
+    expect(receiver.decrypt(encrypted.subarray(0, 4), encrypted.subarray(4))).toEqual(Buffer.from('after'));
   });
 
   it('fails to decrypt with wrong key', () => {

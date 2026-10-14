@@ -4,7 +4,7 @@ export type { KeyboardInfo, TextInputEvent, CompanionEvent } from './appletv.js'
 export { CompanionConnection } from './companion/connection.js';
 export { CompanionPairSetup } from './companion/pair-setup.js';
 export { CompanionSession } from './companion/companion-session.js';
-export { opackEncode, opackDecode } from './companion/opack.js';
+export { opackEncode, opackDecode, OpackFloat } from './companion/opack.js';
 export type { OpackValue, OpackDict } from './companion/opack.js';
 export { FrameType, encodeFrame, parseFrames } from './companion/framing.js';
 export type { Frame } from './companion/framing.js';

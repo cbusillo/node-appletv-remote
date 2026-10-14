@@ -53,11 +53,19 @@ function ed25519PrivateKeyFromSeed(seed: Buffer): KeyObject {
   });
 }
 
+/** Largest request ID an Apple TV echoes unchanged (one-byte OPACK integers are signed). */
+const MAX_TRANSFER_ID = 127;
+/** How long a timed-out request ID stays reserved in case its reply arrives late. */
+const LATE_REPLY_WINDOW_MS = 30_000;
+
 export class CompanionConnection extends EventEmitter {
   private socket: Socket | undefined;
   private session: CompanionSession | undefined;
   private buffer: Buffer = Buffer.alloc(0);
-  private transferId = 0;
+  // A real TV may treat transaction zero as unacknowledged traffic.
+  private transferId = 1;
+  // Request IDs that timed out; reserved until the late reply arrives or the window passes.
+  private timedOutIds = new Map<number, NodeJS.Timeout>();
   private pendingRequests = new Map<number, {
     resolve: (value: OpackDict) => void;
     reject: (error: Error) => void;
@@ -79,6 +87,8 @@ export class CompanionConnection extends EventEmitter {
   private openSocket(): Promise<void> {
     return new Promise((resolve, reject) => {
       this.socket = new Socket();
+      // Touch events are paced by the caller; Nagle buffering distorts gestures.
+      this.socket.setNoDelay(true);
       this.socket.connect(this.port, this.host, () => resolve());
       this.socket.on('error', (err) => {
         reject(err);
@@ -252,7 +262,8 @@ export class CompanionConnection extends EventEmitter {
       throw new Error('Companion not connected');
     }
 
-    const tid = this.transferId++;
+    const tid = this.nextTransferId();
+    if (tid === undefined) throw new Error('Companion has no free request ID');
     content.set('_i', identifier);
     content.set('_x', tid);
 
@@ -263,6 +274,10 @@ export class CompanionConnection extends EventEmitter {
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pendingRequests.delete(tid);
+        // Keep the ID out of rotation so a late reply cannot resolve a newer request.
+        const release = setTimeout(() => this.timedOutIds.delete(tid), LATE_REPLY_WINDOW_MS);
+        release.unref();
+        this.timedOutIds.set(tid, release);
         reject(new Error(`Companion request timeout: ${identifier}`));
       }, timeoutMs);
 
@@ -280,7 +295,26 @@ export class CompanionConnection extends EventEmitter {
   }
 
   /**
-   * Send an OPACK message without waiting for a response.
+   * Apple TVs read one-byte OPACK integers as signed, so an ID from 128 to 255 comes back
+   * changed (255 returns as -1) and its reply never matches. Keep IDs in 1..127, skipping
+   * any still awaiting a reply or reserved after a timeout.
+   */
+  private nextTransferId(): number | undefined {
+    for (let attempt = 0; attempt < MAX_TRANSFER_ID; attempt++) {
+      const id = this.transferId;
+      this.transferId = id >= MAX_TRANSFER_ID ? 1 : id + 1;
+      if (!this.isIdInUse(id)) return id;
+    }
+    return undefined;
+  }
+
+  private isIdInUse(id: OpackValue): boolean {
+    return typeof id === 'number' && (this.pendingRequests.has(id) || this.timedOutIds.has(id));
+  }
+
+  /**
+   * Send an OPACK message without waiting for a response. It shares the request ID counter;
+   * when every ID is in use it reuses one rather than throwing, since no reply is awaited.
    */
   sendMessage(identifier: string, content: OpackDict): void {
     if (!this.session || !this.socket) {
@@ -288,6 +322,11 @@ export class CompanionConnection extends EventEmitter {
     }
 
     content.set('_i', identifier);
+    if (!content.has('_x')) {
+      content.set('_x', this.nextTransferId() ?? this.transferId);
+    } else if (this.isIdInUse(content.get('_x')!)) {
+      throw new Error(`Companion _x ${content.get('_x')} is in use by a pending request`);
+    }
     const payload = opackEncode(content);
     const encrypted = this.session.encrypt(FrameType.E_OPACK, payload);
     this.writeRaw(encrypted);
@@ -298,6 +337,8 @@ export class CompanionConnection extends EventEmitter {
       pending.reject(new Error('Connection closed'));
     }
     this.pendingRequests.clear();
+    for (const timer of this.timedOutIds.values()) clearTimeout(timer);
+    this.timedOutIds.clear();
     this.socket?.destroy();
     this.socket = undefined;
     this.session = undefined;
@@ -365,17 +406,19 @@ export class CompanionConnection extends EventEmitter {
 
   private processEncryptedFrames(): void {
     // Encrypted frames: 4-byte header + ciphertext + 16-byte tag
-    // The header contains the plaintext length, so total = 4 + plaintextLen + 16
+    // The header length already includes the authentication tag.
     while (this.buffer.length >= 4) {
-      const plaintextLen =
-        (this.buffer[1] << 16) | (this.buffer[2] << 8) | this.buffer[3];
-      const totalLen = 4 + plaintextLen + 16;
+      const payloadLen = this.buffer.readUIntBE(1, 3);
+      const totalLen = 4 + payloadLen;
 
       if (this.buffer.length < totalLen) break;
 
       const header = this.buffer.subarray(0, 4);
       const encryptedPayload = this.buffer.subarray(4, totalLen);
       this.buffer = Buffer.from(this.buffer.subarray(totalLen));
+
+      // Companion leaves empty frames unencrypted; decrypting one would consume a nonce.
+      if (payloadLen === 0) continue;
 
       try {
         const plaintext = this.session!.decrypt(header, encryptedPayload);
@@ -395,10 +438,17 @@ export class CompanionConnection extends EventEmitter {
     const identifier = dict.get('_i');
 
     // Check if this is a response to a pending request
-    if (typeof transferId === 'number' && this.pendingRequests.has(transferId)) {
+    if (dict.get('_t') === 3 && typeof transferId === 'number' && this.pendingRequests.has(transferId)) {
       const pending = this.pendingRequests.get(transferId)!;
       this.pendingRequests.delete(transferId);
       pending.resolve(dict);
+      return;
+    }
+
+    // A late reply to a timed-out request frees its ID; it resolves nothing.
+    if (dict.get('_t') === 3 && typeof transferId === 'number' && this.timedOutIds.has(transferId)) {
+      clearTimeout(this.timedOutIds.get(transferId));
+      this.timedOutIds.delete(transferId);
       return;
     }
 

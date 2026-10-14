@@ -3,6 +3,14 @@ import { opackEncode, opackDecode, type OpackDict, type OpackValue } from '../op
 
 describe('OPACK', () => {
   describe('primitives', () => {
+    it('decodes 0x07 as -1, as an Apple TV echoes a request ID it read as signed 255', () => {
+      expect(opackDecode(Buffer.from([0x07]))).toBe(-1);
+      // { _x: -1, _t: 3 } with a one-byte _x, the shape of the reply that ended sessions.
+      const reply = opackDecode(Buffer.from('e2425f7807425f740b', 'hex')) as OpackDict;
+      expect(reply.get('_x')).toBe(-1);
+      expect(reply.get('_t')).toBe(3);
+    });
+
     it('encodes and decodes null', () => {
       const buf = opackEncode(null);
       expect(buf).toEqual(Buffer.from([0x04]));
