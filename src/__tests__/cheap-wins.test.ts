@@ -4,7 +4,7 @@
  * Wire formats follow pyatv (protocols/mrp/messages.py and protocols/companion/api.py).
  */
 import { describe, it, expect, vi } from 'vitest';
-import { AppleTV, PowerState, RepeatState, ShuffleState } from '../appletv.js';
+import { AppleTV, Key, PowerState, RepeatState, ShuffleState, contentItems } from '../appletv.js';
 import { MRPMessage, MessageType } from '../mrp/messages.js';
 import { NowPlayingInfo } from '../now-playing-info.js';
 import type { OpackDict, OpackValue } from '../companion/opack.js';
@@ -218,5 +218,27 @@ describe('NowPlayingInfo app bundle ID', () => {
       { title: 'x' },
     );
     expect(info.appBundleIdentifier).toBe('com.netflix.Netflix');
+  });
+});
+
+describe('sendKeyCommand routing', () => {
+  it('routes skip keys to media commands and home_hold to a 1 s HID press', async () => {
+    const atv = makeAtv();
+    const sent = fakeMrp(atv);
+    const sendKey = vi.spyOn(atv as any, 'sendKey').mockResolvedValue(undefined);
+    await atv.sendKeyCommand(Key.SkipForward);
+    await atv.sendKeyCommand(Key.HomeHold);
+    await atv.sendKeyCommand(Key.Up);
+    expect((sent[0]['.sendCommandMessage'] as any).command).toBe(18);
+    expect(sendKey.mock.calls).toEqual([['home', 1000], ['up']]);
+  });
+});
+
+describe('contentItems', () => {
+  it('returns the playback queue items of a SetState reply, or [] when absent', () => {
+    const item = { identifier: 'a' };
+    expect(contentItems({ '.setStateMessage': { playbackQueue: { contentItems: [item] } } })).toEqual([item]);
+    expect(contentItems({ '.setStateMessage': {} })).toEqual([]);
+    expect(contentItems({})).toEqual([]);
   });
 });
