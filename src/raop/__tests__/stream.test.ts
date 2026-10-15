@@ -82,7 +82,7 @@ async function receiver(mode = 'normal') {
           socket.write('HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n'); continue;
         }
         if (mode === 'legacy-fixture' && uri === '/pair-verify') {
-          // Independent public test vectors from pinned pyatv tests/fake_device/airplay.py.
+          // Independent public legacy pair-verify test vectors.
           const first = '01000000891bae9f581f68f9c9933c4f713fbb5b9de639ec7df5d0a4fd4f342f1c21aa6a5e9d1e843302d6265b8c48dd169e273460e567916b0b36280ac071001118f6b2';
           const second = '00000000a1f91acf64aacb185684080b817103b423816ad63b7f5e001f62337b4cc4b3b92c1474959930b7c2a59d0004814300580459d06fc6cc6441bd82bac72a5c5cc7';
           const accepted = body.toString('hex') === first || body.toString('hex') === second;
@@ -528,7 +528,7 @@ describe('legacy RAOP streaming', () => {
     } finally { cancellation.abort(); await settled; }
   });
 
-  it('matches the pinned upstream legacy verification byte vectors', async () => {
+  it('matches the fixed legacy verification byte vectors', async () => {
     const module = await load(); const peer = await receiver('legacy-fixture'); const cancellation = new AbortController();
     const seed = Buffer.from('8f06696f2542d70df59286c761695c485f815be3d152849e1361282d46ab1493', 'hex');
     const sender = new module.RaopStream('127.0.0.1', peer.port, { ...txt, sf: '0x200' });
@@ -539,7 +539,7 @@ describe('legacy RAOP streaming', () => {
     expect(seed.toString('hex')).toBe('8f06696f2542d70df59286c761695c485f815be3d152849e1361282d46ab1493');
   });
 
-  it('rejects an unpaired legacy seed against the independent upstream receiver vectors', async () => {
+  it('rejects an unpaired legacy seed against the fixed receiver vectors', async () => {
     const module = await load(); const peer = await receiver('legacy-fixture');
     const sender = new module.RaopStream('127.0.0.1', peer.port, { ...txt, sf: '0x200' });
     await expect(sender.stream(Buffer.alloc(4), { legacySeed: Buffer.alloc(32) })).rejects.toThrow(/403/);
