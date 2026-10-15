@@ -1,6 +1,6 @@
 /**
  * AirPlay DataStream framing for the MRP-over-AirPlay data channel: a 32-byte header
- * followed by a binary plist whose `params.data` holds a varint-length-prefixed protobuf.
+ * followed by a binary plist whose `params.data` holds one or more varint-length-prefixed protobufs.
  */
 
 import bplistCreator from 'bplist-creator';
@@ -38,6 +38,36 @@ export function decodeVarint(buf: Buffer, offset = 0): { value: number; bytesRea
 }
 
 /**
+ * Read one varint-length-prefixed entry at `offset`. Returns null while the prefix or body is
+ * incomplete; throws on a prefix over 4 bytes or a length over 16 MiB, which never complete.
+ */
+export function readLengthPrefixed(buf: Buffer, offset = 0): { data: Buffer; next: number } | null {
+  const { value: size, bytesRead: prefix } = decodeVarint(buf, offset);
+  if (prefix > 4 || size > 16 * 1024 * 1024) throw new Error('MRP frame too large');
+  if (prefix === 0 || buf[offset + prefix - 1] & 0x80 || buf.length < offset + prefix + size) return null;
+  return { data: buf.subarray(offset + prefix, offset + prefix + size), next: offset + prefix + size };
+}
+
+/**
+ * Split DataStream `params.data` into protobufs like pyatv `decode_protobufs`: an entry starting
+ * with 0x08 (the ProtocolMessage `type` tag, never a valid length here) is the unprefixed rest of the
+ * payload. Stops, keeping earlier messages, at an incomplete entry or one not starting with 0x08.
+ */
+function splitProtobufs(data: Buffer): Buffer[] {
+  const messages: Buffer[] = [];
+  try {
+    for (let offset = 0; offset < data.length;) {
+      if (data[offset] === 0x08) { messages.push(data.subarray(offset)); break; }
+      const entry = readLengthPrefixed(data, offset);
+      if (!entry || entry.data[0] !== 0x08) break;
+      messages.push(entry.data);
+      offset = entry.next;
+    }
+  } catch { /* oversized prefix: keep earlier messages, like pyatv */ }
+  return messages;
+}
+
+/**
  * Header layout: size (4B BE, includes header) | message type (12B, "sync"/"rply" + NULs) |
  * command (4B) | seqno (8B BE) | padding (4B).
  */
@@ -51,10 +81,9 @@ const COMMAND = Buffer.from('comm', 'ascii');  // 4 bytes
  */
 const globalSeqno = BigInt(0x100000000) + BigInt(Math.floor(Math.random() * 0xFFFFFFFF));
 
-/** Wrap an encoded MRP protobuf message in a DataStream "sync"/"comm" frame. */
-export function buildDataStreamFrame(protobufData: Buffer): Buffer {
-  const varintPrefix = encodeVarint(protobufData.length);
-  const prefixedData = Buffer.concat([varintPrefix, protobufData]);
+/** Wrap encoded MRP protobuf messages, each varint-length-prefixed, in one DataStream "sync"/"comm" frame. */
+export function buildDataStreamFrame(...protobufs: Buffer[]): Buffer {
+  const prefixedData = Buffer.concat(protobufs.flatMap(protobuf => [encodeVarint(protobuf.length), protobuf]));
 
   const plistPayload = bplistCreator({
     params: {
@@ -91,8 +120,8 @@ export function buildDataStreamFrame(protobufData: Buffer): Buffer {
 export interface ParsedDataStreamFrame {
   /** Any type other than "rply" is reported as "sync". */
   messageType: 'sync' | 'rply';
-  /** The MRP protobuf payload, or null when the frame has no `params.data` or its plist is unparseable. */
-  protobufData: Buffer | null;
+  /** Every MRP protobuf in `params.data`, in wire order; a frame may batch several. Empty when there is no `params.data` or the plist is unparseable. */
+  protobufMessages: Buffer[];
   seqno: bigint;
   /** Bytes the frame occupies in the input, header included; advance the buffer by this much. */
   totalSize: number;
@@ -100,7 +129,7 @@ export interface ParsedDataStreamFrame {
 
 /**
  * Parse one frame starting at `offset`. Returns null if the buffer does not yet hold the
- * whole frame; sizes smaller than the header or above 16 MiB throw. Plist parse errors are swallowed and reported as a frame with null payload.
+ * whole frame; sizes smaller than the header or above 16 MiB throw. Plist parse errors are swallowed and reported as a frame with no protobufs.
  */
 export function parseDataStreamFrame(buf: Buffer, offset = 0): ParsedDataStreamFrame | null {
   if (buf.length - offset < HEADER_SIZE) return null;
@@ -115,7 +144,7 @@ export function parseDataStreamFrame(buf: Buffer, offset = 0): ParsedDataStreamF
   const seqno = buf.readBigUInt64BE(offset + 20);
 
   if (totalSize <= HEADER_SIZE) {
-    return { messageType, protobufData: null, seqno, totalSize };
+    return { messageType, protobufMessages: [], seqno, totalSize };
   }
 
   const plistBuf = buf.subarray(offset + HEADER_SIZE, offset + totalSize);
@@ -128,14 +157,12 @@ export function parseDataStreamFrame(buf: Buffer, offset = 0): ParsedDataStreamF
 
     if (!data) {
       // Empty payload (e.g., rply with just {})
-      return { messageType, protobufData: null, seqno, totalSize };
+      return { messageType, protobufMessages: [], seqno, totalSize };
     }
 
-    const { value: protoLength, bytesRead } = decodeVarint(data, 0);
-    const protobufData = data.subarray(bytesRead, bytesRead + protoLength);
-    return { messageType, protobufData, seqno, totalSize };
+    return { messageType, protobufMessages: splitProtobufs(data), seqno, totalSize };
   } catch {
-    return { messageType, protobufData: null, seqno, totalSize };
+    return { messageType, protobufMessages: [], seqno, totalSize };
   }
 }
 

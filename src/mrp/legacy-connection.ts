@@ -6,7 +6,7 @@ import { PairVerify } from '../auth/pair-verify.js';
 import type { HAPCredentials } from '../auth/types.js';
 import { decryptChaCha20, encryptChaCha20, generateNonce, hkdfSha512 } from '../util/crypto.js';
 import { TlvTag, tlvDecode } from '../util/tlv.js';
-import { encodeVarint, decodeVarint } from '../util/data-stream.js';
+import { encodeVarint, readLengthPrefixed } from '../util/data-stream.js';
 import { MRPConnection } from './connection.js';
 import { MRPMessage, MessageType } from './messages.js';
 
@@ -187,17 +187,15 @@ export class LegacyMRPConnection extends MRPConnection {
   private async receive(): Promise<void> {
     const generation = this.mrpGeneration;
     while (this.buffer.length && !this.closed && generation === this.mrpGeneration) {
-      const { value: size, bytesRead: prefix } = decodeVarint(this.buffer);
-      if (prefix > 4 || size > 16 * 1024 * 1024) throw new Error('MRP frame too large');
-      if (this.buffer[prefix - 1] & 0x80 || this.buffer.length < prefix + size) return;
-      let data = this.buffer.subarray(prefix, prefix + size);
-      this.buffer = this.buffer.subarray(prefix + size);
+      const entry = readLengthPrefixed(this.buffer);
+      if (!entry) return;
+      let data = entry.data;
+      this.buffer = this.buffer.subarray(entry.next);
       if (this.inputKey) {
         if (data.length < 16) throw new Error('Truncated encrypted MRP frame');
         data = decryptChaCha20(this.inputKey, generateNonce(this.inCounter++), data.subarray(0, -16), data.subarray(-16), Buffer.alloc(0));
       }
-      try { await this.handleMRPResponse(data); }
-      catch (error) { queueMicrotask(() => { throw error; }); }
+      await this.deliverMRP(data, generation);
       if (this.closed || generation !== this.mrpGeneration) return;
       if (this.encryptionReady && !this.inputKey) {
         const message = await MRPMessage.decode(data);
