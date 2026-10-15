@@ -864,12 +864,16 @@ export class AirPlayConnection extends EventEmitter {
    * identifier, or the next one of `responseType` if the request has no identifier (as pyatv
    * matches them). A reply with a nonzero `errorCode`, or of a type other than
    * `responseType`, rejects; leave `responseType` out to accept any reply type.
-   * @throws if the reply does not arrive within `timeoutMs`; that also ends the connection.
+   * @throws if the reply does not arrive within `timeoutMs`; that also ends the connection
+   * unless `fatalTimeout: false` is given. Then only this request rejects and a late reply
+   * is ignored; use that for requests whose acknowledgement may be slow or absent, such as
+   * an output route change.
    */
   async sendMRPMessageAndWait(
     protobufData: Buffer,
     responseType?: number,
     timeoutMs = 5000,
+    options: { fatalTimeout?: boolean } = {},
   ): Promise<Record<string, unknown>> {
     this.assertOpen();
     if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) throw new RangeError('Invalid MRP timeout');
@@ -878,7 +882,9 @@ export class AirPlayConnection extends EventEmitter {
     const identifier = Object.hasOwn(message, 'identifier') ? message.identifier : undefined;
     if (!identifier && responseType === undefined) throw new Error('MRP request needs an identifier or response type');
     const key = identifier ? `mrp:id:${identifier}` : `mrp:type:${responseType}`;
-    const response = this.pending.create<Record<string, unknown>>(key, timeoutMs);
+    const response = this.pending.create<Record<string, unknown>>(key, timeoutMs, {
+      fatalTimeout: options.fatalTimeout,
+    });
     this.mrpResponseTypes.set(key, responseType);
     try {
       const [, result] = await Promise.all([this.sendMRPMessage(protobufData), response]);

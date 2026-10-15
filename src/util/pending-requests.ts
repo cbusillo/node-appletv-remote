@@ -14,17 +14,18 @@ export class PendingRequests {
 
   /**
    * Wait for the reply to `key`. The timer and entry are removed as soon as it settles.
-   * @throws (rejects) after `timeoutMs`, and then calls `onTimeout`.
+   * @throws (rejects) after `timeoutMs`, and then calls `onTimeout` unless `fatalTimeout`
+   *   is false, for a reply that may be slow or absent where only this wait should fail.
    * @throws synchronously if a wait for `key` is already pending.
    */
-  create<T>(key: string, timeoutMs: number): Promise<T> {
+  create<T>(key: string, timeoutMs: number, options: { fatalTimeout?: boolean } = {}): Promise<T> {
     if (this.entries.has(key)) throw new Error(`An equivalent ${this.label} request is already pending`);
     return new Promise<T>((resolve, reject) => {
       const finish = () => { clearTimeout(timer); this.entries.delete(key); };
       const timer = setTimeout(() => {
         const error = new Error(`${this.label} request timed out`);
         this.reject(key, error);
-        this.onTimeout(error);
+        if (options.fatalTimeout !== false) this.onTimeout(error);
       }, timeoutMs);
       this.entries.set(key, {
         resolve: value => { finish(); resolve(value as T); },
