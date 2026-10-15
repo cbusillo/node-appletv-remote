@@ -196,6 +196,15 @@ export abstract class MRPConnection extends EventEmitter {
     return (entry.type === undefined || entry.type === msg.type) && (entry.identifier === undefined || entry.identifier === msg.identifier);
   }
 
+  /**
+   * Deliver one message unless its session (captured as `generation` when it was queued) closed meanwhile.
+   * Listener exceptions surface as uncaught exceptions, not detached rejections.
+   */
+  protected async deliverMRP(message: Buffer, generation = this.mrpGeneration): Promise<void> {
+    if (this.closed || generation !== this.mrpGeneration) return;
+    try { await this.handleMRPResponse(message); } catch (error) { queueMicrotask(() => { throw error; }); }
+  }
+
   /** Reject all waiters and release their timers on transport loss. */
   protected rejectMRPRequests(error: Error): void {
     for (const entry of [...this.pendingMRPResolvers]) entry.reject(error);

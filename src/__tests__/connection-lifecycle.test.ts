@@ -1,5 +1,6 @@
 /** Offline AirPlay transport loss, pending work, and heartbeat ownership tests. */
 import { EventEmitter } from 'node:events';
+import { setImmediate as settle } from 'node:timers/promises';
 import { afterEach, expect, it, vi } from 'vitest';
 import { AirPlayConnection } from '../connection.js';
 import { MRPMessage, MessageType } from '../mrp/messages.js';
@@ -237,7 +238,6 @@ function deliverBatch(conn: AirPlayConnection, messages: Buffer[]) {
   (conn as any).onDataChannelData(Buffer.from('frame'));
   return { handled, release: () => release() };
 }
-const settle = () => new Promise(resolve => setImmediate(resolve));
 const batch = [Buffer.from([8, 15]), Buffer.from([8, 17]), Buffer.from([8, 4])];
 it('handles every batched DataStream message in order, each after the previous settles', async () => {
   const { conn } = setup();

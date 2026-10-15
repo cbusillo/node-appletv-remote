@@ -195,8 +195,7 @@ export class LegacyMRPConnection extends MRPConnection {
         if (data.length < 16) throw new Error('Truncated encrypted MRP frame');
         data = decryptChaCha20(this.inputKey, generateNonce(this.inCounter++), data.subarray(0, -16), data.subarray(-16), Buffer.alloc(0));
       }
-      try { await this.handleMRPResponse(data); }
-      catch (error) { queueMicrotask(() => { throw error; }); }
+      await this.deliverMRP(data, generation);
       if (this.closed || generation !== this.mrpGeneration) return;
       if (this.encryptionReady && !this.inputKey) {
         const message = await MRPMessage.decode(data);

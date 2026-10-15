@@ -55,14 +55,15 @@ export function readLengthPrefixed(buf: Buffer, offset = 0): { data: Buffer; nex
  */
 function splitProtobufs(data: Buffer): Buffer[] {
   const messages: Buffer[] = [];
-  for (let offset = 0; offset < data.length;) {
-    if (data[offset] === 0x08) return [...messages, data.subarray(offset)];
-    let entry: ReturnType<typeof readLengthPrefixed>;
-    try { entry = readLengthPrefixed(data, offset); } catch { break; }
-    if (!entry || entry.data[0] !== 0x08) break;
-    messages.push(entry.data);
-    offset = entry.next;
-  }
+  try {
+    for (let offset = 0; offset < data.length;) {
+      if (data[offset] === 0x08) { messages.push(data.subarray(offset)); break; }
+      const entry = readLengthPrefixed(data, offset);
+      if (!entry || entry.data[0] !== 0x08) break;
+      messages.push(entry.data);
+      offset = entry.next;
+    }
+  } catch { /* oversized prefix: keep earlier messages, like pyatv */ }
   return messages;
 }
 
