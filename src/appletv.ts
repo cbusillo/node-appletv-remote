@@ -113,6 +113,9 @@ export enum PowerState {
   On = 'on',
 }
 
+/** Every button action mode, in documentation order. */
+export const INPUT_ACTIONS = ['singleTap', 'doubleTap', 'hold'] as const;
+
 /** Text-field focus from Companion RTI (`_tiStart` reply, `_tiStarted`/`_tiStopped` events). */
 export enum KeyboardFocusState {
   Unknown = 'unknown',
@@ -121,7 +124,7 @@ export enum KeyboardFocusState {
 }
 
 /** Button action timing: tap retains existing defaults; hold lasts one second. */
-export type InputAction = 'singleTap' | 'doubleTap' | 'hold';
+export type InputAction = typeof INPUT_ACTIONS[number];
 /** Companion touch phase values. */
 export enum TouchAction { Press = 1, Hold = 3, Release = 4, Click = 5 }
 /** A currently selected output, not a discovered/available AirPlay receiver. */
@@ -129,7 +132,7 @@ export interface OutputDevice { name: string; identifier: string }
 
 /** Reject invalid actions before any input is sent. */
 function validateAction(action: InputAction): void {
-  if (!['singleTap', 'doubleTap', 'hold'].includes(action)) throw new Error(`Unsupported input action: ${action}`);
+  if (!INPUT_ACTIONS.includes(action)) throw new Error(`Unsupported input action: ${action}`);
 }
 /** Touch coordinates are integral device units, inclusive 0..1000. */
 function validateCoordinates(...coordinates: number[]): void {
