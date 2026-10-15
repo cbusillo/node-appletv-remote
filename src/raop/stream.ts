@@ -1,13 +1,21 @@
-/** One-shot legacy RAOP PCM streaming; supports legacy PIN verification but not HAP/AirPlay 2 audio. */
+/**
+ * One-shot RAOP PCM streaming with two profiles chosen from the TXT record. Legacy receivers get
+ * cleartext L16 with optional legacy PIN verification. AirPlay 2 receivers (features bit 38 or 48)
+ * get realtime PCM: HAP pair-verify with stored credentials, encrypted RTSP, plist SETUPs and an
+ * event channel (`airplay2.ts`), then the same paced loop with every audio packet sealed (#22).
+ */
 import { isIPv4, type Socket } from 'node:net';
 import { createSocket, type Socket as DatagramSocket } from 'node:dgram';
 import { randomBytes, createPrivateKey, createPublicKey, diffieHellman, createHash, createCipheriv, sign } from 'node:crypto';
 import { Readable } from 'node:stream';
 import { setTimeout as delay } from 'node:timers/promises';
-import { audioPacket, timingReply, syncPacket, PacketHistory, FRAMES_PER_PACKET, SAMPLE_RATE, PACKET_BYTES } from './packets.js';
+import { audioPacket, sealAudioPacket, timingReply, syncPacket, PacketHistory, FRAMES_PER_PACKET, SAMPLE_RATE, PACKET_BYTES } from './packets.js';
+import { setupAirPlay2Audio, type AirPlay2Audio } from './airplay2.js';
 import { x25519PublicKeyFromRaw, X25519_PKCS8_PREFIX, ed25519PrivateKeyFromSeed } from '../util/crypto.js';
 import { connectSocket, parseHTTPMessage } from '../connection.js';
 import { encodeDmap } from '../dmap/codec.js';
+import type { HAPSession } from '../util/hap-session.js';
+import type { HAPCredentials } from '../auth/types.js';
 
 /** Finite raw PCM chunks; streamed chunks are Buffers of at most 65,536 bytes. */
 export type RaopPcmSource = Buffer | AsyncIterable<Buffer>;
@@ -20,14 +28,27 @@ export interface RaopStreamOptions {
   volume?: number;
   /** Text metadata requires the receiver's md=0 advertisement. */
   metadata?: RaopMetadata;
-  /** Previously paired legacy AirPlay seed (32 bytes), NOT HAP credentials. No pairing/storage access. */
+  /** Previously paired legacy AirPlay seed (32 bytes), NOT HAP credentials. Legacy receivers only. No pairing/storage access. */
   legacySeed?: Buffer;
+  /** HAP credentials from `PairSetup` (as stored by `atv pair`). Required for, and only accepted by, AirPlay 2 receivers. */
+  credentials?: HAPCredentials;
 }
 interface Response { headers: Record<string, string>; code: number; body: Buffer }
 
-/** Serialized legacy HTTP authentication and CSeq-correlated RTSP audio requests on one socket. */
-class RtspClient {
+/** HTTP/1.1 pairing endpoints sent without CSeq on the RTSP socket; everything else is CSeq-correlated RTSP/1.0. */
+const HTTP_PAIRING_URIS = new Set(['/pair-verify', '/pair-pin-start', '/pair-setup']);
+
+/**
+ * Serialized HTTP pairing and CSeq-correlated RTSP audio requests on one socket.
+ * After `encryptWith`, all traffic in both directions uses HAP-encrypted framing.
+ * Exported for tests only; not part of the public API (`src/index.ts`).
+ */
+export class RtspClient {
+  /** Plaintext received and not yet parsed. */
   private input = Buffer.alloc(0);
+  /** Ciphertext received and not yet forming a complete frame (only after `encryptWith`). */
+  private encrypted = Buffer.alloc(0);
+  private cipher?: HAPSession;
   /** Request URI; set by setLocalUri before the first request. */
   private uri = '';
   private cseq = 0;
@@ -41,8 +62,14 @@ class RtspClient {
     this.socket.on('error', error => { this.pending?.reject(error); onFailure(error); });
     this.socket.on('close', () => { const error = new Error('RAOP control connection closed'); this.pending?.reject(error); onFailure(error); });
     this.socket.on('data', (chunk: Buffer) => {
-      this.input = Buffer.concat([this.input, chunk]);
-      try { this.parse(); } catch (error) { this.pending?.reject(error as Error); onFailure(error as Error); this.socket.destroy(); }
+      try {
+        if (this.cipher) {
+          const { plaintext, rest } = this.cipher.decryptAvailable(Buffer.concat([this.encrypted, chunk]));
+          this.encrypted = Buffer.from(rest);
+          this.input = Buffer.concat([this.input, plaintext]);
+        } else this.input = Buffer.concat([this.input, chunk]);
+        this.parse();
+      } catch (error) { this.pending?.reject(error as Error); onFailure(error as Error); this.socket.destroy(); }
     });
   }
   /** Shared HTTP framing (64 KiB header and body caps); RTSP status, a single CSeq and CSeq correlation are checked here. */
@@ -62,12 +89,18 @@ class RtspClient {
       this.pending.resolve({ headers, code: Number(status[2]), body });
     }
   }
+  /**
+   * Encrypt every later write with `session` and decrypt every later read before HTTP parsing.
+   * Call it after the pair-verify (or transient pairing) response and before the next request.
+   * A frame that fails authentication fails the pending request and the client, and destroys the socket.
+   */
+  encryptWith(session: HAPSession): void { this.cipher = session; }
   setLocalUri(sessionId: number): void { this.uri = `rtsp://${this.socket.localAddress}/${sessionId}`; }
   request(method: string, headers: Record<string, string> = {}, body: Buffer = Buffer.alloc(0), signal?: AbortSignal, timeout = 5000, uri = this.uri, allowError = false): Promise<Response> {
     const request = this.queue.then(() => new Promise<Response>((resolve, reject) => {
       if (signal?.aborted) { reject(new Error('RAOP aborted')); return; }
       if (this.socket.destroyed) { reject(new Error('RAOP control connection closed')); return; }
-      const http = method === 'POST' && uri === '/pair-verify';
+      const http = method === 'POST' && HTTP_PAIRING_URIS.has(uri);
       const protocol = http ? 'HTTP/1.1' : 'RTSP/1.0';
       const sequence = http ? undefined : ++this.cseq;
       let settled = false;
@@ -93,7 +126,8 @@ class RtspClient {
         `CSeq: ${sequence}\r\nUser-Agent: AirPlay/550.10\r\nDACP-ID: ${this.senderId}\r\nClient-Instance: ${this.senderId}\r\nActive-Remote: ${this.activeRemote}\r\n`;
       const message = `${method} ${uri} ${protocol}\r\n${controlHeaders}${Object.entries(headers).map(([name, value]) => `${name}: ${value}\r\n`).join('')}Content-Length: ${body.length}\r\n\r\n`;
       try {
-        this.socket.write(Buffer.concat([Buffer.from(message), body]), error => { if (error) finish(error); });
+        const wire = Buffer.concat([Buffer.from(message), body]);
+        this.socket.write(this.cipher ? this.cipher.encrypt(wire) : wire, error => { if (error) finish(error); });
       } catch (error) { finish(error as Error); }
     }));
     this.queue = request.catch(() => undefined);
@@ -103,6 +137,8 @@ class RtspClient {
 
 /** Explicit endpoint plus _raop._tcp TXT capabilities; no discovery or credential access. */
 export class RaopStream {
+  /** `airplay2` when features bit 38 (unified media control) or 48 (CoreUtils pairing) is set, else `legacy`. */
+  private readonly profile: 'legacy' | 'airplay2';
   private readonly requiresLegacySeed: boolean;
   /** md=0 advertised at construction; later caller mutations of the TXT record are ignored. */
   private readonly textMetadata: boolean;
@@ -124,10 +160,16 @@ export class RaopStream {
     if (!features || flags.some(value => !/^(?:0x)?[\da-f]{1,8}$/i.test(value))) throw new Error('Unsupported RAOP receiver flags');
     const status = flags.reduce((value, flag) => value | Number.parseInt(flag, 16), 0);
     const featureBits = BigInt('0x' + features[1]) | (BigInt('0x' + (features[2] ?? '0')) << 32n);
-    this.requiresLegacySeed = !!(status & 0x208);
-    // These advertisements select modern setup/encryption, not legacy PIN verification.
-    const modern = featureBits & ((1n << 38n) | (1n << 40n) | (1n << 43n) | (1n << 48n));
-    if (!has('cn', '0') || !has('et', '0') || !has('tp', 'UDP') || txt.sr !== '44100' || txt.ss !== '16' || txt.ch !== '2' || (txt.pw !== undefined && txt.pw !== 'false') || (status & 0x80) || modern || txt.act === '2' || txt.acl === '1') {
+    this.profile = featureBits & ((1n << 38n) | (1n << 48n)) ? 'airplay2' : 'legacy';
+    // Password and access control fail closed for both profiles.
+    if ((txt.pw !== undefined && txt.pw !== 'false') || (status & 0x80) || txt.act === '2' || txt.acl === '1') {
+      throw new Error('Unsupported RAOP receiver: password or access control required');
+    }
+    // Legacy-only rules. Apple TVs advertise flags=0x244 (includes 0x200), so the PIN rule must not apply to AirPlay 2.
+    this.requiresLegacySeed = this.profile === 'legacy' && !!(status & 0x208);
+    // Bits 40 (buffered audio) and 43 (system pairing) without 38/48 need setup legacy RAOP cannot do.
+    const modernOnly = featureBits & ((1n << 40n) | (1n << 43n));
+    if (this.profile === 'legacy' && (!has('cn', '0') || !has('et', '0') || !has('tp', 'UDP') || txt.sr !== '44100' || txt.ss !== '16' || txt.ch !== '2' || modernOnly)) {
       throw new Error('Unsupported RAOP receiver: requires legacy UDP unencrypted PCM16 stereo 44100 Hz');
     }
   }
@@ -142,6 +184,9 @@ export class RaopStream {
     if (Buffer.isBuffer(pcm) ? pcm.length === 0 || pcm.length % 4 : !pcm || typeof pcm[Symbol.asyncIterator] !== 'function') throw new Error('Expected non-empty complete PCM16 stereo frames or an async Buffer source');
     if (options.volume !== undefined) this.volumeBody(options.volume);
     if (options.metadata) this.metadataBody(options.metadata);
+    if (this.profile === 'airplay2' && !options.credentials) throw new Error('AirPlay 2 RAOP receiver requires HAP credentials');
+    if (this.profile === 'airplay2' && options.legacySeed !== undefined) throw new Error('RAOP legacy seed is not used by AirPlay 2 receivers');
+    if (this.profile === 'legacy' && options.credentials !== undefined) throw new Error('HAP credentials are not used by legacy RAOP receivers');
     if (this.requiresLegacySeed && !options.legacySeed) throw new Error('RAOP receiver requires a previously paired legacy seed');
     if (options.legacySeed !== undefined && (!Buffer.isBuffer(options.legacySeed) || options.legacySeed.length !== 32)) throw new Error('RAOP legacy seed must contain 32 bytes');
     if (options.signal !== undefined && !(options.signal instanceof AbortSignal)) throw new Error('RAOP signal must be an AbortSignal');
@@ -156,6 +201,7 @@ export class RaopStream {
     const history = new PacketHistory();
     let syncTimer: ReturnType<typeof setInterval> | undefined;
     let feedbackTimer: ReturnType<typeof setInterval> | undefined;
+    let airplay2: AirPlay2Audio | undefined;
     const fail = (error: Error) => controller.abort(error);
     let iterator: AsyncIterator<Buffer> | undefined;
     let chunk = Buffer.isBuffer(pcm) ? pcm : Buffer.alloc(0);
@@ -268,23 +314,34 @@ export class RaopStream {
           await client.request('POST', authHeaders, Buffer.concat([Buffer.alloc(4), signature]), controller.signal, 5000, '/pair-verify');
         } finally { shared.fill(0); key?.fill(0); iv?.fill(0); signed?.fill(0); }
       }
-      const sdp = `v=0\r\no=iTunes ${this.ssrc} 0 IN IP4 ${client.socket.localAddress}\r\ns=iTunes\r\nc=IN IP4 ${this.address}\r\nt=0 0\r\nm=audio 0 RTP/AVP 96\r\na=rtpmap:96 L16/44100/2\r\na=fmtp:96 352 0 16 40 10 14 2 255 0 0 44100\r\n`;
-      await client.request('ANNOUNCE', { 'Content-Type': 'application/sdp' }, Buffer.from(sdp), controller.signal);
-      const setup = await client.request('SETUP', { Transport: `RTP/AVP/UDP;unicast;interleaved=0-1;mode=record;control_port=${control.address().port};timing_port=${timing.address().port}` }, undefined, controller.signal);
-      const session = setup.headers.session?.split(';')[0];
-      if (!session || !/^[\w.-]+$/.test(session)) throw new Error('Invalid RAOP session');
-      this.session = session;
-      const transport = setup.headers.transport ?? '';
-      if (!transport.startsWith('RTP/AVP/UDP;') || !transport.split(';').includes('unicast')) throw new Error('Unsupported RAOP transport');
-      const parameters = new Map(transport.split(';').map(item => { const [name, value] = item.trim().split('='); return [name, value]; }));
-      const remotePort = (name: string) => {
-        const value = parameters.get(name) ?? '';
-        if (!/^\d+$/.test(value) || Number(value) < 1 || Number(value) > 65535) throw new Error(`Invalid RAOP ${name}`);
-        return Number(value);
-      };
-      const serverPort = remotePort('server_port'); const controlPort = remotePort('control_port');
-      // An omitted or explicit timing_port=0 is treated as 0; then any receiver port may ask for timing.
-      const timingPort = parameters.has('timing_port') && parameters.get('timing_port') !== '0' ? remotePort('timing_port') : 0;
+      let serverPort: number; let controlPort: number; let timingPort: number;
+      if (this.profile === 'airplay2') {
+        airplay2 = await setupAirPlay2Audio(client, this.address, options.credentials!, this.ssrc,
+          { timing: timing.address().port, control: control.address().port }, controller.signal);
+        // Receivers may omit Session in this profile; '0' is sent instead, as the reference does (unverified on hardware).
+        if (airplay2.session !== undefined && !/^[\w.-]+$/.test(airplay2.session)) throw new Error('Invalid RAOP session');
+        this.session = airplay2.session ?? '0';
+        serverPort = airplay2.serverPort; controlPort = airplay2.controlPort;
+        timingPort = 0; // No timing port is negotiated; answer timing requests from any receiver port.
+      } else {
+        const sdp = `v=0\r\no=iTunes ${this.ssrc} 0 IN IP4 ${client.socket.localAddress}\r\ns=iTunes\r\nc=IN IP4 ${this.address}\r\nt=0 0\r\nm=audio 0 RTP/AVP 96\r\na=rtpmap:96 L16/44100/2\r\na=fmtp:96 352 0 16 40 10 14 2 255 0 0 44100\r\n`;
+        await client.request('ANNOUNCE', { 'Content-Type': 'application/sdp' }, Buffer.from(sdp), controller.signal);
+        const setup = await client.request('SETUP', { Transport: `RTP/AVP/UDP;unicast;interleaved=0-1;mode=record;control_port=${control.address().port};timing_port=${timing.address().port}` }, undefined, controller.signal);
+        const session = setup.headers.session?.split(';')[0];
+        if (!session || !/^[\w.-]+$/.test(session)) throw new Error('Invalid RAOP session');
+        this.session = session;
+        const transport = setup.headers.transport ?? '';
+        if (!transport.startsWith('RTP/AVP/UDP;') || !transport.split(';').includes('unicast')) throw new Error('Unsupported RAOP transport');
+        const parameters = new Map(transport.split(';').map(item => { const [name, value] = item.trim().split('='); return [name, value]; }));
+        const remotePort = (name: string) => {
+          const value = parameters.get(name) ?? '';
+          if (!/^\d+$/.test(value) || Number(value) < 1 || Number(value) > 65535) throw new Error(`Invalid RAOP ${name}`);
+          return Number(value);
+        };
+        serverPort = remotePort('server_port'); controlPort = remotePort('control_port');
+        // An omitted or explicit timing_port=0 is treated as 0; then any receiver port may ask for timing.
+        timingPort = parameters.has('timing_port') && parameters.get('timing_port') !== '0' ? remotePort('timing_port') : 0;
+      }
       // One wall-clock sample anchors every session NTP timestamp to monotonic time.
       const clockStart = performance.now(); const clockEpoch = Date.now();
       const ntpMilliseconds = () => clockEpoch + performance.now() - clockStart;
@@ -303,24 +360,26 @@ export class RaopStream {
       });
       const headers = { Session: this.session, 'RTP-Info': `seq=${this.sequence};rtptime=${this.timestamp}` };
       const record = await client.request('RECORD', { ...headers, Range: 'npt=0-' }, undefined, controller.signal);
-      // Only accept the fixed 66150-frame legacy latency; a different negotiated latency needs a separate profile.
-      if (record.headers['audio-latency'] !== undefined && record.headers['audio-latency'] !== '66150') throw new Error('Unsupported RAOP audio latency');
+      // Legacy accepts only the fixed 66150-frame latency. AirPlay 2 receivers choose their own; it is accepted
+      // while the 66150-frame send schedule is kept (unverified on hardware).
+      if (this.profile === 'legacy' && record.headers['audio-latency'] !== undefined && record.headers['audio-latency'] !== '66150') throw new Error('Unsupported RAOP audio latency');
       await client.request('FLUSH', headers, undefined, controller.signal);
       this.active = true;
       if (options.volume !== undefined) await this.setVolume(options.volume);
       if (options.metadata) await this.setMetadata(options.metadata);
-      // Probe /feedback, then repeat every 25 seconds only if supported.
-      // A failed periodic request is logged and playback continues; transport loss
-      // and malformed replies still fail the stream through the client's onFailure path.
+      // Legacy: probe /feedback, then repeat every 25 seconds only if supported. AirPlay 2: send now and
+      // every 2 seconds without a probe. A failed periodic request is logged and playback continues
+      // (at most one in flight); transport loss and malformed replies still fail the stream through
+      // the client's onFailure path.
       const feedback = () => client.request('POST', {}, undefined, controller.signal, 5000, '/feedback', true);
-      if ((await feedback()).code === 200) {
-        let pending = false;
-        feedbackTimer = setInterval(() => {
-          if (pending || controller.signal.aborted) return;
-          pending = true;
-          void feedback().catch(error => { if (!controller.signal.aborted) console.error(`[RAOP] feedback failed: ${(error as Error).message}`); }).finally(() => { pending = false; });
-        }, 25000);
-      }
+      let pending = false;
+      const tick = () => {
+        if (pending || controller.signal.aborted) return;
+        pending = true;
+        void feedback().catch(error => { if (!controller.signal.aborted) console.error(`[RAOP] feedback failed: ${(error as Error).message}`); }).finally(() => { pending = false; });
+      };
+      if (this.profile === 'airplay2') { tick(); feedbackTimer = setInterval(tick, 2000); }
+      else if ((await feedback()).code === 200) feedbackTimer = setInterval(tick, 25000);
       let start = performance.now(); let epoch = ntpMilliseconds(); let sentFrames = 0; let firstSync = true;
       const sync = () => {
         if (controller.signal.aborted) return;
@@ -329,6 +388,7 @@ export class RaopStream {
       };
       sync(); syncTimer = setInterval(sync, 1000);
       let tail = Math.ceil(66150 / FRAMES_PER_PACKET);
+      let counter = 0n; // AirPlay 2 per-stream nonce counter, one value per audio packet.
       while (payload || tail > 0) {
         const wait = start + sentFrames / SAMPLE_RATE * 1000 - performance.now();
         if (wait > 0) await delay(wait, undefined, { signal: controller.signal });
@@ -336,7 +396,8 @@ export class RaopStream {
         // After a stall (GC, slow source), skip the lost time rather than flood the receiver or abort.
         const lag = performance.now() - (start + sentFrames / SAMPLE_RATE * 1000);
         if (lag > 100) { start += lag; epoch += lag; sync(); }
-        const packet = audioPacket(payload ?? Buffer.alloc(0), this.sequence, this.timestamp, this.ssrc, sentFrames === 0);
+        const plain = audioPacket(payload ?? Buffer.alloc(0), this.sequence, this.timestamp, this.ssrc, sentFrames === 0);
+        const packet = airplay2 ? sealAudioPacket(plain, airplay2.audioKey, counter++) : plain;
         await new Promise<void>((resolve, reject) => audio.send(packet, serverPort, this.address, error => error ? reject(error) : resolve()));
         history.add(packet); this.sequence = (this.sequence + 1) & 0xffff; this.timestamp = (this.timestamp + FRAMES_PER_PACKET) >>> 0; sentFrames += FRAMES_PER_PACKET;
         if (payload) payload = await readPacket(); else tail--;
@@ -364,7 +425,9 @@ export class RaopStream {
       if (this.session && this.client && !this.client.socket.destroyed) {
         try { await this.client.request('TEARDOWN', { Session: this.session }, undefined, undefined, 500); } catch { /* Receiver may already have disconnected. */ }
       }
+      // Destroy RTSP before the event channel: its close handler would otherwise fail the stream again.
       this.client?.socket.destroy(); this.client = undefined; this.session = undefined;
+      airplay2?.events.destroy(); airplay2?.audioKey.fill(0);
       for (const socket of sockets) { try { socket.close(); } catch { /* Bind may have failed before the socket opened. */ } }
       this.cancellation = undefined;
     }
