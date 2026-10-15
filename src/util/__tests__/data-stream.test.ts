@@ -32,20 +32,30 @@ describe('varint encoding', () => {
 });
 
 describe('DataStream framing', () => {
-  function batchFrame(messages: Buffer[]): Buffer {
-    const payload = bplistCreator({ params: { data: Buffer.concat(messages.map(message =>
-      Buffer.concat([encodeVarint(message.length), message]),
-    )) } });
-    const header = buildDataStreamFrame(Buffer.alloc(0)).subarray(0, 32);
-    header.writeUInt32BE(32 + payload.length);
-    return Buffer.concat([header, payload]);
+  /** A frame whose `params.data` is exactly `data`, for payloads the builder never produces. */
+  function frameWithData(data: Buffer): Buffer {
+    const plist = bplistCreator({ params: { data } });
+    const header = buildDataStreamFrame().subarray(0, 32);
+    header.writeUInt32BE(32 + plist.length);
+    return Buffer.concat([header, plist]);
   }
 
   it('preserves every protobuf in a batch, in order', () => {
     const messages = [Buffer.from([8, 15]), Buffer.from([8, 17]), Buffer.from([8, 4])];
-    const frame = parseDataStreamFrame(batchFrame(messages));
-    expect(frame?.protobufMessages).toEqual(messages);
-    expect(frame?.protobufData).toEqual(messages[0]);
+    expect(parseDataStreamFrame(buildDataStreamFrame(...messages))?.protobufMessages).toEqual(messages);
+  });
+
+  it.each([
+    ['a zero-length entry', [2, 8, 15, 0, 0, 0], [[8, 15]]],
+    ['an unterminated length varint', [2, 8, 15, 0x81], [[8, 15]]],
+    ['an entry longer than the payload', [2, 8, 15, 5, 8, 1], [[8, 15]]],
+    ['a length prefix over 4 bytes', [2, 8, 15, 0x80, 0x80, 0x80, 0x80, 0x80, 1], [[8, 15]]],
+    ['an entry not starting with the type tag', [2, 8, 15, 1, 0x12], [[8, 15]]],
+    ['an unprefixed message after a prefixed one', [2, 8, 15, 8, 4, 0x12, 0], [[8, 15], [8, 4, 0x12, 0]]],
+    ['an empty payload', [], []],
+  ])('splits a payload with %s like pyatv decode_protobufs', (_, data, expected) => {
+    const frame = parseDataStreamFrame(frameWithData(Buffer.from(data)));
+    expect(frame?.protobufMessages).toEqual(expected.map(bytes => Buffer.from(bytes)));
   });
 
   it('builds a frame with a 32-byte header', () => {

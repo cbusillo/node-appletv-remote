@@ -141,6 +141,7 @@ export class AirPlayConnection extends MRPConnection {
   private pendingRTSP = new Map<string, (err: Error) => void>();
   private feedbackInterval?: ReturnType<typeof setInterval>;
   private dataDecBuffer = Buffer.alloc(0);
+  private mrpDelivery = Promise.resolve();
 
 
   constructor(
@@ -652,8 +653,8 @@ export class AirPlayConnection extends MRPConnection {
   private dataEncBuffer: Buffer = Buffer.alloc(0);
 
   /**
-   * Decrypt data-channel bytes, ack every "sync" DataStream frame with a "rply", and hand
-   * every protobuf payload in each frame to `handleMRPResponse`, in wire order.
+   * Decrypt data-channel bytes, ack every "sync" DataStream frame with a "rply", and deliver
+   * every protobuf in each frame in wire order (see `deliverMRP`).
    */
   private onDataChannelData(data: Buffer): void {
     if (this.closed || !this.dataSession) return;
@@ -677,17 +678,28 @@ export class AirPlayConnection extends MRPConnection {
           socket?.write(encrypted, err => { if (err && this.dataSocket === socket) this.fail(err); });
         }
 
-        for (const protobufData of frame.protobufMessages) {
-          void this.handleMRPResponse(protobufData).catch(error => {
-            // EventEmitter listener exceptions must remain uncaught exceptions, not detached rejections.
-            queueMicrotask(() => { throw error; });
-          });
-        }
+        if (frame.protobufMessages.length) this.deliverMRP(frame.protobufMessages);
 
         // Advance buffer past this frame
         this.dataDecBuffer = this.dataDecBuffer.subarray(frame.totalSize);
       }
     } catch (err) { this.fail(err); }
+  }
+
+  /**
+   * Hand each message to `handleMRPResponse` after the previous one settles, like the legacy
+   * transport, so a waiter resolved by one message can register for the next. A closed or
+   * replaced session drops the rest.
+   */
+  private deliverMRP(messages: Buffer[]): void {
+    const generation = this.mrpGeneration;
+    for (const message of messages) {
+      this.mrpDelivery = this.mrpDelivery.then(async () => {
+        if (this.closed || generation !== this.mrpGeneration) return;
+        // EventEmitter listener exceptions must remain uncaught exceptions, not detached rejections.
+        try { await this.handleMRPResponse(message); } catch (error) { queueMicrotask(() => { throw error; }); }
+      });
+    }
   }
 
   /** POST /feedback every 2 s, at most one in flight; failure terminates the transport. */
@@ -772,6 +784,7 @@ export class AirPlayConnection extends MRPConnection {
     this.session = this.eventSession = this.dataSession = undefined;
     this.sharedSecret = undefined;
     this.rawBuffer = this.rtspDecBuffer = this.encryptedBuffer = this.eventEncBuffer = this.eventDecBuffer = this.dataEncBuffer = this.dataDecBuffer = Buffer.alloc(0);
+    this.mrpDelivery = Promise.resolve();
     this.emit('close');
   }
 }

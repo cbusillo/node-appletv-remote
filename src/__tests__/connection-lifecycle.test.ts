@@ -3,6 +3,7 @@ import { EventEmitter } from 'node:events';
 import { afterEach, expect, it, vi } from 'vitest';
 import { AirPlayConnection } from '../connection.js';
 import { MRPMessage, MessageType } from '../mrp/messages.js';
+import { buildDataStreamFrame } from '../util/data-stream.js';
 const credentials = { clientId: 'test', serverId: 'server', clientLTSK: Buffer.alloc(32), clientLTPK: Buffer.alloc(32), serverLTPK: Buffer.alloc(32) };
 function setup() {
   const conn = new AirPlayConnection('offline', 7000, credentials);
@@ -219,13 +220,42 @@ it('surfaces async listener failures as exceptions rather than unhandled rejecti
   const error = new Error('listener failed');
   vi.spyOn(conn as any, 'handleMRPResponse').mockRejectedValue(error);
   const schedule = vi.spyOn(globalThis, 'queueMicrotask').mockImplementation(() => {});
-  const { buildDataStreamFrame } = await import('../util/data-stream.js');
   (conn as any).dataSession = { decryptAvailable: () => ({ plaintext: buildDataStreamFrame(Buffer.from([8, 4])), rest: Buffer.alloc(0) }), encrypt: () => Buffer.alloc(0) };
   (conn as any).onDataChannelData(Buffer.from('frame'));
-  await Promise.resolve();
-  expect(schedule).toHaveBeenCalledOnce();
+  await vi.waitFor(() => expect(schedule).toHaveBeenCalledOnce());
   expect(schedule.mock.calls[0][0]).toThrow('listener failed');
   conn.close();
+});
+
+/** Feed one batched DataStream frame whose first message stays in flight until `release` runs. */
+function deliverBatch(conn: AirPlayConnection, messages: Buffer[]) {
+  let release!: () => void;
+  const handled = vi.spyOn(conn as any, 'handleMRPResponse')
+    .mockImplementationOnce(() => new Promise<void>(resolve => { release = resolve; }))
+    .mockResolvedValue(undefined);
+  (conn as any).dataSession = { decryptAvailable: () => ({ plaintext: buildDataStreamFrame(...messages), rest: Buffer.alloc(0) }), encrypt: () => Buffer.alloc(0) };
+  (conn as any).onDataChannelData(Buffer.from('frame'));
+  return { handled, release: () => release() };
+}
+const settle = () => new Promise(resolve => setImmediate(resolve));
+const batch = [Buffer.from([8, 15]), Buffer.from([8, 17]), Buffer.from([8, 4])];
+it('handles every batched DataStream message in order, each after the previous settles', async () => {
+  const { conn } = setup();
+  const { handled, release } = deliverBatch(conn, batch);
+  await settle();
+  expect(handled).toHaveBeenCalledOnce();
+  release();
+  await vi.waitFor(() => expect(handled.mock.calls.map(call => call[0])).toEqual(batch));
+  conn.close();
+});
+it('drops the rest of a batch when its session closes mid-delivery', async () => {
+  const { conn } = setup();
+  const { handled, release } = deliverBatch(conn, batch);
+  await settle();
+  conn.close();
+  release();
+  await settle();
+  expect(handled).toHaveBeenCalledOnce();
 });
 
 it.each(['raw', 'rtsp', 'event'])('rejects oversized HTTP framing on the %s channel before buffering its body', channel => {

@@ -526,7 +526,8 @@ an open or connecting connection rejects. Close cancels pending TCP setup as wel
 protocol waiters; await the canceled setup promise before reusing a low-level connection
 instance. AppleTV can install a replacement immediately; stale instance events and failures
 cannot clear it or forward stale state/events into it. In-flight MRP decoding is discarded
-when its session closes, even if the transport instance reconnects. State listeners run before
+when its session closes, even if the transport instance reconnects. Messages batched in one
+DataStream frame are handled in order, each after the previous finishes. State listeners run before
 request waiters resume (also when a listener throws); user listener exceptions are not
 swallowed as decode failures. Socket-dispatched listener exceptions surface as uncaught
 exceptions, not unhandled promise rejections.
