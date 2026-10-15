@@ -1341,7 +1341,7 @@ export const MRP_SCHEMA: Record<string, unknown> = {
           "type": "string",
           "id": 2
         },
-        "priority": {
+        "errorCode": {
           "type": "int32",
           "id": 4
         },

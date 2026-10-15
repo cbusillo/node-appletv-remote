@@ -55,6 +55,6 @@ message ProtocolMessage {
 
   optional Type type = 1; // Identifies which underlying message is filled in.
   optional string identifier = 2;
-  optional int32 priority = 4;
+  optional int32 errorCode = 4;
   optional uint64 timestamp = 5;
 }

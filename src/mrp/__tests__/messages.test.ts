@@ -25,6 +25,12 @@ describe('MRP Messages', () => {
     expect(decoded).toBeDefined();
   });
 
+  it('decodes field 4 as errorCode, as in pyatv 0.18.0', async () => {
+    // Independent wire encoding: identifier field 2 = "A", errorCode field 4 = 6.
+    const decoded = await MRPMessage.decode(Buffer.from([0x12, 0x01, 0x41, 0x20, 0x06]));
+    expect(decoded.errorCode).toBe(6);
+  });
+
   it('creates a SendButtonEventMessage', async () => {
     const msg = await MRPMessage.sendButtonEvent(1, 0x8C, true);
     expect(msg).toBeInstanceOf(Buffer);
