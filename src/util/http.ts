@@ -5,6 +5,9 @@
 
 import http from 'node:http';
 
+/** Deadline for opening a new TCP connection, shared with `connectSocket`. */
+export const CONNECT_TIMEOUT_MS = 5000;
+
 /** Headers an AirPlay sender sends on pairing requests; X-Apple-HKP: 3 selects HomeKit-style pairing. */
 const DEFAULT_HEADERS: Record<string, string> = {
   'User-Agent': 'AirPlay/320.20',
@@ -22,7 +25,7 @@ export class PersistentHttp {
   private host: string;
   private port: number;
 
-  /** @param timeoutMs Socket inactivity timeout per request; 0 disables it (DMAP long polls). */
+  /** @param timeoutMs Socket inactivity timeout per request, armed once connected; 0 disables it (DMAP long polls). */
   constructor(host: string, port: number, private headers: Record<string, string> = DEFAULT_HEADERS, private timeoutMs = 10_000) {
     this.host = host;
     this.port = port;
@@ -40,7 +43,9 @@ export class PersistentHttp {
   }
 
   /** Raw GET/POST response for protocols that handle authentication statuses themselves.
-   * Requests time out after `timeoutMs` (default 10 s) of socket inactivity and responses are capped at 8 MiB.
+   * Opening a new connection fails after `CONNECT_TIMEOUT_MS`, requests time out after `timeoutMs`
+   * (default 10 s) of socket inactivity, and responses are capped at 8 MiB.
+   * @throws (rejects) on connect timeout, socket error, inactivity timeout, or an oversized/aborted response.
    */
   async request(method: 'GET' | 'POST', path: string, body: Buffer = Buffer.alloc(0)): Promise<{ status: number; body: Buffer }> {
     return new Promise((resolve, reject) => {
@@ -72,6 +77,15 @@ export class PersistentHttp {
           });
         },
       );
+      // req.setTimeout only arms after connect, so bound a fresh handshake separately; otherwise a stale
+      // address waits out the OS SYN timeout (~75 s macOS).
+      req.on('socket', (socket) => {
+        if (!socket.connecting) return; // reused keep-alive socket
+        const timer = setTimeout(() => req.destroy(new Error(`Connect to ${this.host}:${this.port} timed out`)), CONNECT_TIMEOUT_MS);
+        const clear = (): void => clearTimeout(timer);
+        socket.once('connect', clear);
+        req.once('close', clear);
+      });
       if (this.timeoutMs > 0) req.setTimeout(this.timeoutMs, () => req.destroy(new Error('HTTP request timeout')));
       req.on('error', reject);
       req.write(body);
