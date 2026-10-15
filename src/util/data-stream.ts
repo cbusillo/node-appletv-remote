@@ -91,8 +91,10 @@ export function buildDataStreamFrame(protobufData: Buffer): Buffer {
 export interface ParsedDataStreamFrame {
   /** Any type other than "rply" is reported as "sync". */
   messageType: 'sync' | 'rply';
-  /** The MRP protobuf payload, or null when the frame has no `params.data` or its plist is unparseable. */
+  /** The first MRP protobuf payload, or null when the frame has no `params.data` or its plist is unparseable. */
   protobufData: Buffer | null;
+  /** Every length-prefixed protobuf in `params.data`, in wire order; a frame may batch several. */
+  protobufMessages: Buffer[];
   seqno: bigint;
   /** Bytes the frame occupies in the input, header included; advance the buffer by this much. */
   totalSize: number;
@@ -115,7 +117,7 @@ export function parseDataStreamFrame(buf: Buffer, offset = 0): ParsedDataStreamF
   const seqno = buf.readBigUInt64BE(offset + 20);
 
   if (totalSize <= HEADER_SIZE) {
-    return { messageType, protobufData: null, seqno, totalSize };
+    return { messageType, protobufData: null, protobufMessages: [], seqno, totalSize };
   }
 
   const plistBuf = buf.subarray(offset + HEADER_SIZE, offset + totalSize);
@@ -128,14 +130,19 @@ export function parseDataStreamFrame(buf: Buffer, offset = 0): ParsedDataStreamF
 
     if (!data) {
       // Empty payload (e.g., rply with just {})
-      return { messageType, protobufData: null, seqno, totalSize };
+      return { messageType, protobufData: null, protobufMessages: [], seqno, totalSize };
     }
 
-    const { value: protoLength, bytesRead } = decodeVarint(data, 0);
-    const protobufData = data.subarray(bytesRead, bytesRead + protoLength);
-    return { messageType, protobufData, seqno, totalSize };
+    const protobufMessages: Buffer[] = [];
+    for (let cursor = 0; cursor < data.length;) {
+      const { value: protoLength, bytesRead } = decodeVarint(data, cursor);
+      cursor += bytesRead;
+      protobufMessages.push(data.subarray(cursor, cursor + protoLength));
+      cursor += protoLength;
+    }
+    return { messageType, protobufData: protobufMessages[0] ?? null, protobufMessages, seqno, totalSize };
   } catch {
-    return { messageType, protobufData: null, seqno, totalSize };
+    return { messageType, protobufData: null, protobufMessages: [], seqno, totalSize };
   }
 }
 

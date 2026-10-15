@@ -1,4 +1,5 @@
 import { describe, it, expect } from 'vitest';
+import bplistCreator from 'bplist-creator';
 import { encodeVarint, decodeVarint, buildDataStreamFrame, parseDataStreamFrame } from '../data-stream.js';
 
 describe('varint encoding', () => {
@@ -31,6 +32,22 @@ describe('varint encoding', () => {
 });
 
 describe('DataStream framing', () => {
+  function batchFrame(messages: Buffer[]): Buffer {
+    const payload = bplistCreator({ params: { data: Buffer.concat(messages.map(message =>
+      Buffer.concat([encodeVarint(message.length), message]),
+    )) } });
+    const header = buildDataStreamFrame(Buffer.alloc(0)).subarray(0, 32);
+    header.writeUInt32BE(32 + payload.length);
+    return Buffer.concat([header, payload]);
+  }
+
+  it('preserves every protobuf in a batch, in order', () => {
+    const messages = [Buffer.from([8, 15]), Buffer.from([8, 17]), Buffer.from([8, 4])];
+    const frame = parseDataStreamFrame(batchFrame(messages));
+    expect(frame?.protobufMessages).toEqual(messages);
+    expect(frame?.protobufData).toEqual(messages[0]);
+  });
+
   it('builds a frame with a 32-byte header', () => {
     const data = Buffer.from([0x08, 0x01]); // minimal protobuf
     const frame = buildDataStreamFrame(data);

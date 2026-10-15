@@ -653,7 +653,7 @@ export class AirPlayConnection extends MRPConnection {
 
   /**
    * Decrypt data-channel bytes, ack every "sync" DataStream frame with a "rply", and hand
-   * each protobuf payload to `handleMRPResponse`.
+   * every protobuf payload in each frame to `handleMRPResponse`, in wire order.
    */
   private onDataChannelData(data: Buffer): void {
     if (this.closed || !this.dataSession) return;
@@ -677,8 +677,8 @@ export class AirPlayConnection extends MRPConnection {
           socket?.write(encrypted, err => { if (err && this.dataSocket === socket) this.fail(err); });
         }
 
-        if (frame.protobufData) {
-          void this.handleMRPResponse(frame.protobufData).catch(error => {
+        for (const protobufData of frame.protobufMessages) {
+          void this.handleMRPResponse(protobufData).catch(error => {
             // EventEmitter listener exceptions must remain uncaught exceptions, not detached rejections.
             queueMicrotask(() => { throw error; });
           });
