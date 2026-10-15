@@ -19,6 +19,7 @@ import { Command, SupportedCommand } from './supported-command.js';
 import { Message } from './message.js';
 import { CompanionConnection } from './companion/connection.js';
 import { CompanionPairSetup } from './companion/pair-setup.js';
+import { readTextSession, rtiClearTextPayload, rtiInputTextPayload } from './companion/text-input.js';
 import type { OpackDict, OpackValue } from './companion/opack.js';
 import type { HAPCredentials } from './auth/types.js';
 import type { DiscoveredDeviceInfo } from './discovery.js';
@@ -40,7 +41,7 @@ export interface TextInputEvent {
   timestamp?: number;
 }
 
-/** MRP TextInputMessage action types used by setText/insertText/clearText/deleteText. */
+/** MRP TextInputMessage action types: `TextInputEvent.actionType` values, and the Delete that deleteText sends. */
 export enum TextInputActionType {
   Unknown = 0,
   Insert = 1,
@@ -358,8 +359,8 @@ export class AppleTV extends EventEmitter {
   }
 
   /**
-   * Open the Companion connection; emits `companionConnect` once ready.
-   * @throws If no Companion port was given or discovered.
+   * Open the Companion connection and send `_systemInfo`; emits `companionConnect` once ready.
+   * @throws If no Companion port was given or discovered, or the TV rejects `_systemInfo`.
    */
   async connectCompanion(credentials: HAPCredentials, companionPort?: number): Promise<void> {
     if (this.companionConnection) throw new Error('Companion already connected');
@@ -384,6 +385,12 @@ export class AppleTV extends EventEmitter {
 
     try {
       await connection.connect();
+      // Without _systemInfo the TV answers app, account and power requests with "No request handler" (pyatv api.py).
+      await connection.sendRequest('_systemInfo', new Map<OpackValue, OpackValue>([
+        ['_bf', 0], ['_cf', 512], ['_clFl', 128], ['_i', this.deviceId.replaceAll(':', '').toLowerCase()],
+        ['_idsID', credentials.clientId], ['_pubID', this.deviceId], ['_sf', 256], ['_sv', '170.18'],
+        ['model', this.model], ['name', this.name],
+      ]));
       if (this.companionConnection !== connection) throw new Error('Companion closed during setup');
       this.readyTransports.add(connection);
       this.emit('companionConnect');
@@ -614,25 +621,33 @@ export class AppleTV extends EventEmitter {
 
   // --- Text input ---
 
-  /** Replace the focused text field's contents. */
-  async setText(text: string): Promise<void> {
-    const conn = this.requireConnection();
-    const msg = await MRPMessage.textInput(text, TextInputActionType.Set);
-    await conn.sendMRPMessage(msg);
-  }
+  /** Replace the focused text field's contents (Companion); resolves with the new text. */
+  async setText(text: string): Promise<string> { return this.editText(text, true); }
 
-  /** Insert text into the focused text field. */
-  async insertText(text: string): Promise<void> {
-    const conn = this.requireConnection();
-    const msg = await MRPMessage.textInput(text, TextInputActionType.Insert);
-    await conn.sendMRPMessage(msg);
-  }
+  /** Insert text at the cursor of the focused text field (Companion); resolves with the new text. */
+  async insertText(text: string): Promise<string> { return this.editText(text, false); }
 
-  /** Clear the focused text field. */
-  async clearText(): Promise<void> {
-    const conn = this.requireConnection();
-    const msg = await MRPMessage.textInput('', TextInputActionType.ClearText);
-    await conn.sendMRPMessage(msg);
+  /** Clear the focused text field (Companion); resolves with the empty text. */
+  async clearText(): Promise<string> { return this.editText('', true); }
+
+  /** Read the focused text field's contents (Companion) without editing it. */
+  async getText(): Promise<string> { return this.editText('', false); }
+
+  /**
+   * pyatv CompanionKeyboard: restart the RTI session for fresh state, then send `_tiC` edits.
+   * Modern tvOS ignores the MRP TextInputMessage, so text input needs connectCompanion().
+   * @throws If no text field is focused (the `_tiStart` reply has no `_tiD`).
+   */
+  private async editText(text: string, clear: boolean): Promise<string> {
+    const conn = this.requireCompanion();
+    await conn.sendRequest('_tiStop', new Map());
+    const archive = (await this.companionContent('_tiStart')).get('_tiD');
+    if (!Buffer.isBuffer(archive)) throw new Error('No text field is focused');
+    const { sessionUUID, text: current } = readTextSession(archive);
+    const send = (payload: Buffer) => conn.sendMessage('_tiC', new Map<OpackValue, OpackValue>([['_tiV', 1], ['_tiD', payload]]));
+    if (clear) send(rtiClearTextPayload(sessionUUID));
+    if (text) send(rtiInputTextPayload(sessionUUID, text));
+    return (clear ? '' : current) + text;
   }
 
   /** Send a Delete text-input action to the focused text field. */
@@ -922,7 +937,8 @@ export class AppleTV extends EventEmitter {
       if (this.activeTouch) this.sendTouch(this.activeTouch.x, this.activeTouch.y, TouchAction.Release);
       await this.checkedCompanion(session.connection, '_sessionStop', new Map<OpackValue, OpackValue>([['_srvT', 'com.apple.tvremoteservices'], ['_sid', session.sid]]));
     } catch (error) {
-      errors.push(error);
+      // A real TV drops this session once an AirPlay/MRP connection is open; it is already stopped (pyatv also ignores it).
+      if (!(error instanceof Error && error.message.endsWith('Session not found'))) errors.push(error);
     } finally {
       this.touchSession = undefined;
       this.activeTouch = undefined;
