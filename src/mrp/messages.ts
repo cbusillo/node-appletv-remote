@@ -8,7 +8,7 @@ import protobuf from 'protobufjs';
 import { randomUUID } from 'node:crypto';
 import { MRP_SCHEMA } from './schema.js';
 
-/** ProtocolMessage.type values: which extension field a message carries. Gaps are types this library does not use. */
+/** ProtocolMessage.type discriminators, not extension IDs; declare each value in ProtocolMessage.proto too. */
 export enum MessageType {
   SendCommand = 1,
   SendCommandResult = 2,
@@ -45,18 +45,21 @@ export enum MessageType {
   SetReadyState = 36,
   DeviceInfoUpdate = 37,
   SetConnectionState = 38,
+  SendButtonEvent = 39,
   SetHiliteMode = 40,
   WakeDevice = 41,
   GenericMessage = 42,
-  SendButtonEvent = 43,
   SetNowPlayingClient = 46,
   SetNowPlayingPlayer = 47,
+  ModifyOutputContextRequest = 48,
   SetVolume = 51,
   VolumeDidChange = 52,
   RemoveClient = 53,
   RemovePlayer = 54,
   UpdateClient = 55,
   UpdateContentItem = 56,
+  UpdateOutputDevice = 65,
+  RemoveOutputDevices = 66,
   SetDefaultSupportedCommands = 72,
 }
 
@@ -141,6 +144,16 @@ async function encodeMessage(
 
 /** Static builders that return encoded ProtocolMessage buffers ready to frame and send, plus `decode` for incoming ones. */
 export class MRPMessage {
+  /** Shared audio routing uses discriminator 48, extension 52; paired fields support cluster-aware receivers. */
+  static async modifyOutputDevices(mode: 'add' | 'remove' | 'set', devices: string[]): Promise<Buffer> {
+    const field = { add: 'addingDevices', remove: 'removingDevices', set: 'settingDevices' }[mode];
+    return encodeMessage(MessageType.ModifyOutputContextRequest, {
+      key: '.modifyOutputContextRequestMessage', typeName: 'ModifyOutputContextRequestMessage',
+      fields: { type: 1, [field]: devices,
+        [`clusterAware${field[0].toUpperCase()}${field.slice(1)}`]: devices },
+    });
+  }
+
   /** DeviceInfo: the first message after connecting, describing this client to the Apple TV. */
   static async deviceInfo(options: DeviceInfoOptions): Promise<Buffer> {
     return encodeMessage(MessageType.DeviceInfo, {
@@ -172,13 +185,15 @@ export class MRPMessage {
     return encodeMessage(type);
   }
 
-  /** Decode a ProtocolMessage; extensions appear as '.fooMessage' keys on the result. */
-  static async decode(
-    buffer: Buffer,
-  ): Promise<protobuf.Message & Record<string, unknown>> {
+  /**
+   * Decode a ProtocolMessage into a plain object; extensions appear as '.fooMessage' keys.
+   * Only fields present on the wire are set: no proto2 defaults (e.g. `playbackState: 0`)
+   * and no empty repeated fields, so `'field' in msg` means the device sent it (pyatv HasField).
+   * Enums stay numeric, int64 become numbers and bytes stay Buffers.
+   */
+  static async decode(buffer: Buffer): Promise<Record<string, unknown>> {
     const ProtocolMessage = lookupType('ProtocolMessage');
-    const decoded = ProtocolMessage.decode(buffer);
-    return decoded as protobuf.Message & Record<string, unknown>;
+    return ProtocolMessage.toObject(ProtocolMessage.decode(buffer), { longs: Number });
   }
 
   /**
@@ -213,7 +228,7 @@ export class MRPMessage {
     });
   }
 
-  /** SendButtonEvent: a button down or up identified by HID usage page and usage. */
+  /** SendButtonEvent: type 39 with extension field 43, carrying HID usage page, usage and down/up. */
   static async sendButtonEvent(
     usagePage: number,
     usage: number,
@@ -250,8 +265,8 @@ export class MRPMessage {
     });
   }
 
-  /** CryptoPairing: wraps a HAP pairing TLV for pairing carried inside MRP. */
-  static async cryptoPairing(pairingData: Buffer): Promise<Buffer> {
+  /** CryptoPairing: wraps HAP TLV; isPairing selects state 2 for pair-setup M1 only. */
+  static async cryptoPairing(pairingData: Buffer, isPairing = false): Promise<Buffer> {
     // CryptoPairing messages must NOT include an identifier.
     // pyatv uses generate_identifier=False; the Apple TV never echoes
     // identifiers for crypto messages and may ignore requests that have one.
@@ -265,7 +280,7 @@ export class MRPMessage {
           status: 0,
           isRetrying: false,
           isUsingSystemPairing: false,
-          state: 0,
+          state: isPairing ? 2 : 0,
         },
       },
       { omitIdentifier: true },

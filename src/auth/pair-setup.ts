@@ -1,12 +1,12 @@
 /**
  * HAP pair-setup (SRP-6a with the PIN shown on screen) for the AirPlay/MRP channel.
- * Runs the M1–M6 exchange over HTTP POST /pair-setup and returns long-term
+ * Runs M1–M6 over HTTP POST /pair-setup or an injected standalone MRP TLV carrier, returning long-term
  * credentials that PairVerify / AirPlayConnection use on later connections.
  */
 
-import { generateKeyPairSync, sign, createPrivateKey, randomUUID } from 'node:crypto';
+import { generateKeyPairSync, sign, randomUUID } from 'node:crypto';
 import { TlvTag, tlvEncode, tlvDecode } from '../util/tlv.js';
-import { hkdfSha512, encryptChaCha20, decryptChaCha20 } from '../util/crypto.js';
+import { hkdfSha512, encryptChaCha20, decryptChaCha20, ed25519PrivateKeyFromSeed } from '../util/crypto.js';
 import { SRPClient } from './srp.js';
 import { PersistentHttp } from '../util/http.js';
 import type { HAPCredentials } from './types.js';
@@ -17,16 +17,17 @@ import type { HAPCredentials } from './types.js';
  * Ed25519 long-term key pair, which end up in the returned credentials.
  */
 export class PairSetup {
-  private http: PersistentHttp;
-  private clientId: string;
+  private http: Pick<PersistentHttp, 'post' | 'destroy'>;
+  /** Controller pairing identifier sent in M5 and returned as `clientId` in the credentials. */
+  readonly clientId: string;
   private edPrivateKeyRaw: Buffer;
   private edPublicKeyRaw: Buffer;
   private srp = new SRPClient();
   private sessionKey: Buffer | undefined;
 
-  /** Opens a persistent HTTP connection and generates this controller's identity and Ed25519 key pair. */
-  constructor(host: string, port: number) {
-    this.http = new PersistentHttp(host, port);
+  /** Generate controller keys; use the provided TLV carrier or persistent AirPlay HTTP. */
+  constructor(host: string, port: number, transport?: Pick<PersistentHttp, 'post' | 'destroy'>) {
+    this.http = transport ?? new PersistentHttp(host, port);
     this.clientId = randomUUID();
 
     const { publicKey, privateKey } = generateKeyPairSync('ed25519');
@@ -140,15 +141,7 @@ export class PairSetup {
     const clientIdBuf = Buffer.from(this.clientId);
     const deviceInfo = Buffer.concat([signingKey, clientIdBuf, this.edPublicKeyRaw]);
 
-    // Sign with Ed25519 (raw 32-byte seed wrapped in a PKCS#8 DER prefix)
-    const edKey = createPrivateKey({
-      key: Buffer.concat([
-        Buffer.from('302e020100300506032b657004220420', 'hex'),
-        this.edPrivateKeyRaw,
-      ]),
-      format: 'der',
-      type: 'pkcs8',
-    });
+    const edKey = ed25519PrivateKeyFromSeed(this.edPrivateKeyRaw);
     const signature = sign(null, deviceInfo, edKey);
 
     // Build sub-TLV for encrypted data
