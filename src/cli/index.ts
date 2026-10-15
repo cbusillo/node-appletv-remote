@@ -29,6 +29,7 @@ function envMs(name: string, fallback: number): number {
   return process.env[name]?.trim() && Number.isFinite(value) && value >= 0 ? value : fallback;
 }
 // HID keys get no device acknowledgment, so the CLI waits before trusting a send (old fixed values).
+// Settle applies to every MRP connect: any first request may be lost before the device is ready.
 const settleMs = (): number => envMs('ATV_SETTLE_MS', 500);
 const postSendMs = (): number => envMs('ATV_POST_SEND_MS', 1000);
 
@@ -257,9 +258,11 @@ async function cmdRemote(deviceId?: string) {
 async function cmdState(deviceId?: string) {
   const atv = await connectToDevice(deviceId);
   try {
-    console.log('Requesting state...');
+    console.error('Requesting state...');
     const info = await atv.getNowPlaying();
-    console.log(info.hasPlayback ? info.toString() : `Nothing playing. [${info.playbackState === PlaybackState.Stopped ? 'Stopped' : 'Absent'}]`);
+    const stopped = info.playbackState === PlaybackState.Stopped;
+    const idle = !info.hasPlayback && (stopped || info.playbackState === PlaybackState.Unknown);
+    console.log(idle ? `Nothing playing. [${stopped ? 'Stopped' : 'Absent'}]` : info.toString());
   } finally {
     await atv.close();
   }
@@ -269,7 +272,7 @@ async function cmdState(deviceId?: string) {
 async function cmdQueue(deviceId?: string) {
   const atv = await connectToDevice(deviceId);
   try {
-    console.log('Requesting playback queue...');
+    console.error('Requesting playback queue...');
     const response = await atv.requestPlaybackQueue({
       location: 0,
       length: 20,
@@ -294,7 +297,7 @@ async function cmdQueue(deviceId?: string) {
 async function cmdArtwork(deviceId?: string, outputFile?: string) {
   const atv = await connectToDevice(deviceId);
   try {
-    console.log('Requesting artwork...');
+    console.error('Requesting artwork...');
     const artwork = await atv.requestArtwork(600, 600);
     if (artwork) {
       const filename = outputFile ?? 'artwork.jpg';
@@ -565,14 +568,18 @@ export async function main(argv: string[]): Promise<void> {
     if (Array.isArray(result)) {
       for (const item of result) console.log(`${'bundleId' in item ? item.bundleId : item.id}\t${item.name}`);
     } else if (result !== undefined) console.log(result);
-    await delay(postSendMs());
+    // Queries return a reply, so only unacknowledged sends (which return undefined) need the post-send wait.
+    if (result === undefined) await delay(postSendMs());
   } finally {
     await atv.close();
   }
 }
 
 // Importing the CLI for tests does not execute commands or touch stored credentials.
-if (process.argv[1] && import.meta.url === pathToFileURL(realpathSync(process.argv[1])).href) {
+// realpathSync resolves npm bin symlinks; an unresolvable argv[1] just means "not the script".
+let isScript = false;
+try { isScript = Boolean(process.argv[1]) && import.meta.url === pathToFileURL(realpathSync(process.argv[1])).href; } catch { /* not the script */ }
+if (isScript) {
   main(process.argv.slice(2)).catch((error: unknown) => {
     console.error(`Error: ${error instanceof Error ? error.message : String(error)}`);
     process.exitCode = 1;

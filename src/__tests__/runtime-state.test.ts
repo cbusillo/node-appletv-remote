@@ -24,19 +24,21 @@ describe('media acknowledgments', () => {
       sendMRPMessage: async () => {},
       sendMRPMessageAndWait: async (bytes: Buffer, type: number) => {
         expect((await MRPMessage.decode(bytes)).type).toBe(1);
-        expect(type).toBe(2);
+        // pyatv send_and_receive matches by identifier only.
+        expect(type).toBeUndefined();
         return { type: 2, '.sendCommandResultMessage': { sendError, handlerReturnStatus: 0 } };
       },
     };
     if (sendError === 0) await expect(atv.play()).resolves.toBeUndefined();
     else await expect(atv.play()).rejects.toThrow(`sendError=${sendError}`);
   });
-  it('uses sendError rejection with handler diagnostics and rejects a missing result extension', async () => {
+  it('uses sendError rejection with handler diagnostics and accepts a missing result extension', async () => {
     const atv = device();
     (atv as any).connection = { sendMRPMessage: async () => {}, sendMRPMessageAndWait: async () => ({ '.sendCommandResultMessage': { handlerReturnStatus: 2, sendError: 8 } }) };
     await expect(atv.pause()).rejects.toThrow('handlerReturnStatus=2');
+    // pyatv: no inner SendCommandResultMessage means sendError NoError.
     (atv as any).connection = { sendMRPMessage: async () => {}, sendMRPMessageAndWait: async () => ({ type: 2 }) };
-    await expect(atv.pause()).rejects.toThrow('Malformed');
+    await expect(atv.pause()).resolves.toBeUndefined();
   });
   it('accepts a decoded acknowledgment whose status fields are omitted (pyatv: absent sendError is NoError)', async () => {
     const atv = device();
@@ -123,6 +125,36 @@ describe('unified player state', () => {
     deliver(atv, MessageType.SetNowPlayingClient, 'setNowPlayingClientMessage', {});
     expect((atv as any).nowPlaying.hasPlayback).toBe(false);
   });
+  it('treats an empty now-playing client as the active client (pyatv: bundle id \'\')', () => {
+    const atv = device();
+    deliver(atv, MessageType.SetNowPlayingClient, 'setNowPlayingClientMessage', {});
+    deliver(atv, MessageType.SetState, 'setStateMessage', { playbackState: 3 });
+    expect(atv.nowPlaying).toMatchObject({ hasPlayback: false, playbackState: PlaybackState.Stopped });
+  });
+  it('retains only snapshot state fields, not queue artwork, from SetState', () => {
+    const atv = device();
+    deliver(atv, MessageType.SetState, 'setStateMessage', { playerPath: path('app'), playbackState: 1, displayName: 'App',
+      playbackQueue: { contentItems: [{ identifier: 'x', artworkData: Buffer.alloc(1024), metadata: { title: 'T' } }] } });
+    const player = (atv as any).playerState.clients.get('app').players.get('MediaRemote-DefaultPlayer');
+    expect(player.state).toEqual({ playbackState: 1, displayName: 'App' });
+    expect(player.items[0].artworkData).toBeUndefined();
+    expect(atv.nowPlaying).toMatchObject({ title: 'T', playbackState: PlaybackState.Playing, appDisplayName: 'App' });
+  });
+  it('does not retain Buffer views of the frame in nowPlayingInfo or item metadata', () => {
+    const atv = device();
+    const frame = Buffer.alloc(4096);
+    const view = () => frame.subarray(0, 8);
+    deliver(atv, MessageType.SetState, 'setStateMessage', { playerPath: path('app'),
+      nowPlayingInfo: { title: 'D', artworkDataDigest: view() },
+      playbackQueue: { contentItems: [{ identifier: 'x', metadata: { title: 'T', nowPlayingInfoData: view() } }] } });
+    deliver(atv, MessageType.SetState, 'setStateMessage', { playerPath: path('app'), nowPlayingInfo: { title: 'D', artworkDataDigest: view() } });
+    deliver(atv, MessageType.UpdateContentItem, 'updateContentItemMessage', { playerPath: path('app'),
+      contentItems: [{ identifier: 'x', metadata: { artworkURLTemplatesData: view() } }] });
+    const player = (atv as any).playerState.clients.get('app').players.get('MediaRemote-DefaultPlayer');
+    const stored = [...Object.values(player.direct), ...player.items.flatMap((item: any) => Object.values(item.metadata ?? {}))];
+    expect(stored.filter(value => Buffer.isBuffer(value) && value.buffer === frame.buffer)).toEqual([]);
+    expect(atv.nowPlaying.title).toBe('D');
+  });
   it('uses the same snapshot for getNowPlaying and events', async () => {
     const atv = device();
     let emitted: unknown;
@@ -138,6 +170,177 @@ describe('unified player state', () => {
     expect(events).toBe(1);
     expect(info).toBe(emitted);
     expect(info.playbackState).toBe(PlaybackState.Stopped);
+  });
+});
+
+describe('cache-first normalized state reads', () => {
+  it.each([
+    { playbackState: 1, nowPlayingInfo: { title: 'Pushed' } },
+    { playbackState: 2, playbackQueue: { location: 0, contentItems: [{ identifier: 'x', metadata: { title: 'Paused' } }] } },
+    { playbackState: 3, playbackQueue: { contentItems: [] } },
+    { playbackQueue: { contentItems: [] } },
+    { playbackState: 0 },
+    { nowPlayingInfo: { title: 'State not reported' } },
+  ])('returns received active-player state without a queue response: %j', async payload => {
+    const atv = device();
+    (atv as any).connection = {};
+    const getState = vi.spyOn(atv, 'getState').mockRejectedValue(new Error('Queue must not be required'));
+    deliver(atv, MessageType.SetNowPlayingClient, 'setNowPlayingClientMessage', { client: { bundleIdentifier: 'app' } });
+    deliver(atv, MessageType.SetState, 'setStateMessage', { playerPath: path('app'), ...payload });
+    const snapshot = atv.nowPlaying;
+    await expect(atv.getNowPlaying()).resolves.toBe(snapshot);
+    expect(getState).not.toHaveBeenCalled();
+    if (!('playbackState' in payload)) expect(snapshot.playbackState).toBe(PlaybackState.Unknown);
+    if (!('nowPlayingInfo' in payload) && !('playbackQueue' in payload)) expect(snapshot.hasPlayback).toBe(false);
+  });
+
+  it.each([
+    [MessageType.SetNowPlayingClient, 'setNowPlayingClientMessage', { client: { bundleIdentifier: 'app' } }],
+    [MessageType.SetNowPlayingPlayer, 'setNowPlayingPlayerMessage', { playerPath: path('app') }],
+    [MessageType.SetState, 'setStateMessage', { playerPath: path('app'), supportedCommands: { supportedCommands: [] } }],
+    [MessageType.SetState, 'setStateMessage', { playerPath: path('app'), nowPlayingInfo: {} }],
+  ] as const)('does not treat identity or commands as a received playback snapshot: %s', async (type, field, payload) => {
+    const atv = device();
+    (atv as any).connection = {};
+    const error = new Error('Timeout waiting for MRP message type 4');
+    const getState = vi.spyOn(atv, 'getState').mockRejectedValue(error);
+    deliver(atv, type, field, payload);
+    await expect(atv.getNowPlaying()).rejects.toBe(error);
+    expect(getState).toHaveBeenCalledOnce();
+  });
+
+  it('resolves nothing playing for an idle TV that selects the empty now-playing client', async () => {
+    const atv = device();
+    (atv as any).connection = {};
+    const getState = vi.spyOn(atv, 'getState').mockResolvedValue({ type: 4, '.setStateMessage': {} });
+    deliver(atv, MessageType.SetNowPlayingClient, 'setNowPlayingClientMessage', {});
+    await expect(atv.getNowPlaying()).resolves.toMatchObject({ hasPlayback: false, playbackState: PlaybackState.Unknown });
+    expect(getState).not.toHaveBeenCalled();
+  });
+
+  it('requests a queue once the empty client selects a specific player with no state', async () => {
+    const atv = device();
+    (atv as any).connection = {};
+    const error = new Error('Timeout waiting for MRP message type 4');
+    const getState = vi.spyOn(atv, 'getState').mockRejectedValue(error);
+    deliver(atv, MessageType.SetNowPlayingClient, 'setNowPlayingClientMessage', {});
+    deliver(atv, MessageType.SetNowPlayingPlayer, 'setNowPlayingPlayerMessage', { playerPath: { player: { identifier: 'p' } } });
+    await expect(atv.getNowPlaying()).rejects.toBe(error);
+    expect(getState).toHaveBeenCalledOnce();
+  });
+
+  it('does not bypass the queue for the first pushed player before any active routing selection', async () => {
+    const atv = device();
+    (atv as any).connection = {};
+    const error = new Error('Timeout waiting for MRP message type 4');
+    const getState = vi.spyOn(atv, 'getState').mockRejectedValue(error);
+    deliver(atv, MessageType.SetState, 'setStateMessage', { playerPath: path('inactive'), nowPlayingInfo: { title: 'First push' } });
+    await expect(atv.getNowPlaying()).rejects.toBe(error);
+    expect(getState).toHaveBeenCalledOnce();
+    deliver(atv, MessageType.SetNowPlayingPlayer, 'setNowPlayingPlayerMessage', { playerPath: path('other', 'selected') });
+    await expect(atv.getNowPlaying()).rejects.toBe(error);
+    getState.mockResolvedValue({ type: 4, '.setStateMessage': {} });
+    await expect(atv.getNowPlaying()).rejects.toThrow('No active-player state received');
+  });
+
+  it('only uses state for the currently selected client/player', async () => {
+    const atv = device();
+    (atv as any).connection = {};
+    const error = new Error('Timeout waiting for MRP message type 4');
+    vi.spyOn(atv, 'getState').mockRejectedValue(error);
+    deliver(atv, MessageType.SetNowPlayingClient, 'setNowPlayingClientMessage', { client: { bundleIdentifier: 'active' } });
+    deliver(atv, MessageType.SetState, 'setStateMessage', { playerPath: path('inactive'), nowPlayingInfo: { title: 'Other app' } });
+    await expect(atv.getNowPlaying()).rejects.toBe(error);
+    deliver(atv, MessageType.SetState, 'setStateMessage', { playerPath: path('active', 'other'), nowPlayingInfo: { title: 'Other player' } });
+    await expect(atv.getNowPlaying()).rejects.toBe(error);
+    deliver(atv, MessageType.SetNowPlayingPlayer, 'setNowPlayingPlayerMessage', { playerPath: path('active', 'other') });
+    await expect(atv.getNowPlaying()).resolves.toMatchObject({ title: 'Other player' });
+    deliver(atv, MessageType.RemovePlayer, 'removePlayerMessage', { playerPath: path('active', 'other') });
+    await expect(atv.getNowPlaying()).rejects.toBe(error);
+    deliver(atv, MessageType.SetNowPlayingClient, 'setNowPlayingClientMessage', { client: { bundleIdentifier: 'inactive' } });
+    await expect(atv.getNowPlaying()).resolves.toMatchObject({ title: 'Other app' });
+    deliver(atv, MessageType.RemoveClient, 'removeClientMessage', { client: { bundleIdentifier: 'inactive' } });
+    await expect(atv.getNowPlaying()).rejects.toBe(error);
+  });
+
+  it('keeps raw getState as a correlated queue request even with a cached snapshot', async () => {
+    const atv = device();
+    const raw = { type: 4, identifier: 'reply', '.setStateMessage': { playbackState: 2, nowPlayingInfo: { title: 'Raw' } } };
+    (atv as any).connection = { sendMRPMessageAndWait: async (bytes: Buffer, type: number, timeout: number) => {
+      const request = await MRPMessage.decode(bytes);
+      expect(request.type).toBe(MessageType.PlaybackQueueRequest);
+      expect(request['.playbackQueueRequestMessage']).toMatchObject({ location: 0, length: 1, includeMetadata: true });
+      expect(type).toBe(MessageType.SetState);
+      expect(timeout).toBe(10000);
+      return raw;
+    } };
+    deliver(atv, MessageType.SetState, 'setStateMessage', { nowPlayingInfo: { title: 'Pushed' } });
+    await expect(atv.getState()).resolves.toBe(raw);
+  });
+
+  it('accepts a queue-only SetState reply as active-player state', async () => {
+    const atv = device();
+    (atv as any).connection = { sendMRPMessageAndWait: async () => {
+      const response = { type: 4, '.setStateMessage': { playbackQueue: { contentItems: [] } } };
+      (atv as any).handleMRPMessage(response);
+      return response;
+    } };
+    await expect(atv.getNowPlaying()).resolves.toMatchObject({ hasPlayback: false, playbackState: PlaybackState.Unknown });
+  });
+
+  it('does not report absent playback when a queue reply has no selected-player state', async () => {
+    const atv = device();
+    (atv as any).connection = { sendMRPMessageAndWait: async () => ({ type: 4, '.setStateMessage': {} }) };
+    await expect(atv.getNowPlaying()).rejects.toThrow('No active-player state received');
+  });
+
+  it.each([
+    ['without playerPath', { playbackState: 1 }],
+    ['for another player', { playerPath: path('app', 'other'), playbackState: 1 }],
+  ])('resolves the routed player snapshot when a valid queue reply arrives %s', async (_label, reply) => {
+    const atv = device();
+    (atv as any).connection = { sendMRPMessageAndWait: async () => {
+      const response = { type: 4, '.setStateMessage': reply };
+      (atv as any).handleMRPMessage(response);
+      return response;
+    } };
+    deliver(atv, MessageType.SetNowPlayingClient, 'setNowPlayingClientMessage', { client: { bundleIdentifier: 'app' } });
+    await expect(atv.getNowPlaying()).resolves.toMatchObject({ hasPlayback: false, appBundleIdentifier: 'app' });
+  });
+
+  it('a decoded empty queue reply cannot validate an earlier unrouted push', async () => {
+    const atv = device();
+    // Wire type 4 with an empty SetStateMessage extension: no playbackState or playerPath on the wire.
+    (atv as any).connection = { sendMRPMessageAndWait: async () => MRPMessage.decode(Buffer.from('08044a00', 'hex')) };
+    deliver(atv, MessageType.SetState, 'setStateMessage', { nowPlayingInfo: { title: 'Stale push' } });
+    await expect(atv.getNowPlaying()).rejects.toThrow('No active-player state received');
+  });
+
+  it('rejects disconnected reads even if public nowPlaying was retained by a caller', async () => {
+    const atv = device();
+    deliver(atv, MessageType.SetState, 'setStateMessage', { nowPlayingInfo: { title: 'Pushed' } });
+    await expect(atv.getNowPlaying()).rejects.toThrow('Not connected');
+  });
+
+  it('does not hide a real queue timeout behind a push received while the request is pending', async () => {
+    vi.useFakeTimers();
+    const atv = device();
+    const conn = new AirPlayConnection('offline', 7000, { clientId: 'test', serverId: 'test', clientLTSK: Buffer.alloc(32), clientLTPK: Buffer.alloc(32), serverLTPK: Buffer.alloc(32) });
+    const send = vi.spyOn(conn, 'sendMRPMessage').mockImplementation(async () => {
+      deliver(atv, MessageType.SetNowPlayingClient, 'setNowPlayingClientMessage', { client: { bundleIdentifier: 'app' } });
+      deliver(atv, MessageType.SetState, 'setStateMessage', { playerPath: path('app'), nowPlayingInfo: { title: 'Unsolicited' } });
+    });
+    (atv as any).connection = conn;
+    try {
+      const rejection = expect(atv.getNowPlaying()).rejects.toThrow('Timeout waiting for MRP message type 4');
+      await vi.advanceTimersByTimeAsync(10000);
+      await rejection;
+      await expect(atv.getNowPlaying()).resolves.toMatchObject({ title: 'Unsolicited' });
+      expect(send).toHaveBeenCalledOnce();
+    } finally {
+      await atv.close();
+      vi.useRealTimers();
+    }
   });
 });
 

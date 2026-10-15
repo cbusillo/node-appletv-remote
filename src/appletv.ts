@@ -12,9 +12,9 @@ import { AirPlayConnection } from './connection.js';
 import { LegacyMRPConnection } from './mrp/legacy-connection.js';
 import type { MRPConnection } from './mrp/connection.js';
 import { Credentials } from './credentials.js';
-import { MRPMessage, HID_KEY_MAP, MessageType } from './mrp/messages.js';
+import { MRPMessage, HID_KEY_MAP, MessageType, PLAYER_STATE_FIELDS } from './mrp/messages.js';
 import { NowPlayingInfo } from './now-playing-info.js';
-import { PlayerState } from './mrp/player-state.js';
+import { DEFAULT_PLAYER, PlayerState, carriesState } from './mrp/player-state.js';
 import { Command, SupportedCommand } from './supported-command.js';
 import { Message } from './message.js';
 import { CompanionConnection } from './companion/connection.js';
@@ -178,7 +178,7 @@ export interface CompanionEvent {
  * Client for one Apple TV. Call connect() for MRP features and connectCompanion()
  * for Companion features; methods throw if their connection is not open.
  *
- * Events: `connect`, `close`, `error`, `message`, `nowPlaying`, `supportedCommands`,
+ * Events: `connect`, `close`, `error`, `message`, `mrpDiagnostic`, `nowPlaying`, `supportedCommands`,
  * `playbackQueue`, `featureAvailability`, `keyboard`, `textInput`, `volume`, `powerState`, `companionConnect`,
  * `companionClose`, `companionError`, `companionEvent`, `outputDevices`.
  * `close`/`companionClose` fire only after the matching connect event; failed setup only rejects.
@@ -294,6 +294,11 @@ export class AppleTV extends EventEmitter {
       if (this.readyTransports.has(connection)) this.emit('close');
     });
     connection.on('error', (err) => { if (this.airPlayErrorSource === connection && this.listenerCount('error')) this.emit('error', err); });
+    if (this.listenerCount('mrpDiagnostic')) {
+      connection.on('mrp-diagnostic', diagnostic => {
+        if (this.connection === connection && this.listenerCount('mrpDiagnostic')) this.emit('mrpDiagnostic', diagnostic);
+      });
+    }
     connection.on('mrp-message', (msg: Record<string, unknown>) => {
       if (this.connection !== connection) return;
       this.handleMRPMessage(msg);
@@ -312,32 +317,30 @@ export class AppleTV extends EventEmitter {
   }
 
   /**
-   * Cancel gestures, attempt touch cleanup, then close both transports even if cleanup fails.
-   * A touch startup still in flight is abandoned (closing Companion ends it), not awaited.
+   * Cancel gestures, attempt best-effort touch cleanup, then close both transports; never rejects.
+   * Touch teardown errors are ignored (call stopTouch() first to observe them). A touch startup
+   * still in flight is abandoned (closing Companion ends it), not awaited.
    */
   async close(): Promise<void> {
     this.gestureController?.abort();
-    try {
-      if (!this.touchStarting) await this.stopTouch();
-    } finally {
-      const companion = this.companionConnection;
-      const connection = this.connection;
-      // Invalidate forwarding before low-level close emits synchronous lifecycle events.
-      this.companionConnection = undefined;
-      this.connection = undefined;
-      this.companionErrorSource = undefined;
-      this.airPlayErrorSource = undefined;
-      this.touchSession = undefined;
-      this.activeTouch = undefined;
-      this.pendingRouting?.reject(new Error('Connection closed'));
-      companion?.close();
-      connection?.close();
-      this.reportedOutputs = [];
-      this.reportedLeader = undefined;
-      this.resetRuntimeState();
-      if (companion && this.readyTransports.has(companion)) this.emit('companionClose');
-      if (connection && this.readyTransports.has(connection)) this.emit('close');
-    }
+    if (!this.touchStarting) await this.stopTouch().catch(() => {});
+    const companion = this.companionConnection;
+    const connection = this.connection;
+    // Invalidate forwarding before low-level close emits synchronous lifecycle events.
+    this.companionConnection = undefined;
+    this.connection = undefined;
+    this.companionErrorSource = undefined;
+    this.airPlayErrorSource = undefined;
+    this.touchSession = undefined;
+    this.activeTouch = undefined;
+    this.pendingRouting?.reject(new Error('Connection closed'));
+    companion?.close();
+    connection?.close();
+    this.reportedOutputs = [];
+    this.reportedLeader = undefined;
+    this.resetRuntimeState();
+    if (companion && this.readyTransports.has(companion)) this.emit('companionClose');
+    if (connection && this.readyTransports.has(connection)) this.emit('close');
   }
 
   // --- Companion protocol ---
@@ -563,8 +566,8 @@ export class AppleTV extends EventEmitter {
 
   /** Track DeviceInfo selected groups; reject UUID-correlated envelope errors regardless of discriminator. */
   private handleOutputMessage(msg: Record<string, unknown>): void {
-    if (msg.identifier === this.pendingRouting?.identifier && msg.errorCode) {
-      this.pendingRouting?.reject(new Error(`Output routing rejected: ${msg.errorDescription ?? msg.errorCode}`));
+    if (this.pendingRouting && msg.identifier === this.pendingRouting.identifier && msg.errorCode) {
+      this.pendingRouting.reject(new Error(`Output routing rejected: ${msg.errorDescription ?? msg.errorCode}`));
       return;
     }
     // Types 65/66 update/remove output-device records; neither confirms the selected group.
@@ -641,10 +644,29 @@ export class AppleTV extends EventEmitter {
 
   // --- State request ---
 
-  /** Fetch and normalize state using the same model as nowPlaying events. */
+  /**
+   * Return the received active-player snapshot used by nowPlaying events after device routing selection.
+   * A selected empty client (idle TV) with no selected player resolves as nothing playing without a queue request.
+   * Without selected state evidence, request a queue reply; its timeout/error still rejects.
+   * After a routing selection, a successful reply resolves with the selected player's snapshot (nothing playing if it has no state).
+   * Without one, a reply lacking state for the model's current player rejects rather than inventing absent playback.
+   * Requires an open connection and does not extrapolate position or force a refresh.
+   */
   async getNowPlaying(): Promise<NowPlayingInfo> {
-    // The transport delivers replies through mrp-message before resolving its waiter.
-    await this.getState();
+    this.requireConnection();
+    if (!this.playerState.hasSelectedSnapshot) {
+      // The transport delivers replies through mrp-message before resolving its waiter.
+      const response = await this.getState();
+      if (this.playerState.routingSelected) return this.nowPlaying;
+      const state = response['.setStateMessage'] as Record<string, unknown> | undefined;
+      const path = state?.playerPath as { client?: { bundleIdentifier?: string }; player?: { identifier?: string } } | undefined;
+      const replyMatchesPlayer = this.nowPlaying.appBundleIdentifier === (path?.client?.bundleIdentifier ?? '') &&
+        this.nowPlaying.playerIdentifier === (path?.player?.identifier ?? DEFAULT_PLAYER);
+      // A real reply may establish legacy unrouted state; an empty/unrelated reply cannot validate an earlier push.
+      if (!(state && carriesState(state) && replyMatchesPlayer && this.playerState.hasSnapshot)) {
+        throw new Error('No active-player state received');
+      }
+    }
     return this.nowPlaying;
   }
 
@@ -734,15 +756,15 @@ export class AppleTV extends EventEmitter {
   private async sendMediaCommand(command: number, options?: Record<string, unknown>): Promise<void> {
     const conn = this.requireConnection();
     const msg = await MRPMessage.sendMediaCommand(command, options);
-    const response = await conn.sendMRPMessageAndWait(msg, MessageType.SendCommandResult);
+    // pyatv send_and_receive matches the reply by identifier only, not by message type.
+    const response = await conn.sendMRPMessageAndWait(msg, undefined);
     if (typeof response.errorCode === 'number' && response.errorCode !== 0) {
       throw new Error(`Media command ${command} rejected: errorCode=${response.errorCode} ${response.errorDescription ?? ''}`);
     }
     const result = response['.sendCommandResultMessage'] as Record<string, unknown> | undefined;
-    // pyatv checks only sendError; an omitted proto2 field is its default (NoError).
-    if (!result) throw new Error('Malformed media-command acknowledgment');
-    const sendError = result.sendError ?? 0;
-    const status = result.handlerReturnStatus ?? 0;
+    // pyatv checks only sendError; an absent result extension or omitted proto2 field means NoError.
+    const sendError = result?.sendError ?? 0;
+    const status = result?.handlerReturnStatus ?? 0;
     if (sendError !== 0) throw new Error(`Media command ${command} rejected: sendError=${sendError}, handlerReturnStatus=${status}`);
   }
 
@@ -956,13 +978,7 @@ export class AppleTV extends EventEmitter {
       }
     }
 
-    const stateFields: Partial<Record<MessageType, string>> = {
-      [MessageType.SetState]: '.setStateMessage', [MessageType.UpdateContentItem]: '.updateContentItemMessage',
-      [MessageType.SetNowPlayingClient]: '.setNowPlayingClientMessage', [MessageType.SetNowPlayingPlayer]: '.setNowPlayingPlayerMessage',
-      [MessageType.UpdateClient]: '.updateClientMessage', [MessageType.RemoveClient]: '.removeClientMessage',
-      [MessageType.RemovePlayer]: '.removePlayerMessage', [MessageType.SetDefaultSupportedCommands]: '.setDefaultSupportedCommandsMessage',
-    };
-    const field = stateFields[msg.type as MessageType];
+    const field = PLAYER_STATE_FIELDS[msg.type as MessageType];
     const payload = field ? msg[field] as Record<string, unknown> | undefined : undefined;
     if (payload && this.playerState.update(msg.type as number, payload)) this.publishNowPlaying();
     if (msg.type === MessageType.VolumeControlAvailability) {

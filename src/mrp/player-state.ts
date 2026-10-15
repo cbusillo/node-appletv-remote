@@ -5,10 +5,13 @@ import { MessageType } from './messages.js';
 
 type Payload = Record<string, any>;
 interface Player {
+  /** Only the SetState fields snapshot() reads (playbackState, displayName); never queue/artwork payloads. */
   state: Payload;
   direct: Payload;
   items: Payload[];
   location: number;
+  /** A SetState carried state (see carriesState); identity/commands alone do not set it. */
+  hasState?: boolean;
   commands?: SupportedCommand[];
 }
 interface Client {
@@ -17,13 +20,30 @@ interface Client {
   active?: string | null;
   commands?: SupportedCommand[];
 }
-const DEFAULT_PLAYER = 'MediaRemote-DefaultPlayer';
+/** Player identifier MRP implies when a playerPath omits one. */
+export const DEFAULT_PLAYER = 'MediaRemote-DefaultPlayer';
+/** Bundle key for a client without a bundle identifier; pyatv models the empty now-playing client (idle TV) this way. */
+const EMPTY_CLIENT = '';
+
+/** SetState evidence of player state: playback state (even unknown), a queue (even empty), or direct now-playing fields. */
+export function carriesState(setState: Payload): boolean {
+  return typeof setState.playbackState === 'number' || setState.playbackQueue !== undefined ||
+    Object.keys(setState.nowPlayingInfo ?? {}).length > 0;
+}
+
+/** Shallow copy whose bytes fields are copied: protobufjs decodes bytes as views of the frame, which can pin a large artwork frame. */
+function detach(fields: Payload): Payload {
+  const copy: Payload = {};
+  for (const [key, value] of Object.entries(fields)) copy[key] = value instanceof Uint8Array ? Buffer.from(value) : value;
+  return copy;
+}
 
 /** Keeps inactive-player updates separate until the device selects that client/player. */
 export class PlayerState {
   private clients = new Map<string, Client>();
   private activeClient?: string;
   private selected = false;
+  private routed = false;
 
   /** Current active-player commands; undefined means no advertisement has arrived. */
   get commands(): SupportedCommand[] | undefined {
@@ -31,6 +51,27 @@ export class PlayerState {
     const player = client?.active === null ? undefined : client?.players.get(client.active ?? DEFAULT_PLAYER);
     if (!player?.commands) return client?.commands;
     return [...player.commands, ...(client?.commands ?? []).filter(cmd => !player.commands!.some(p => p.command === cmd.command))];
+  }
+
+  /** A SetNowPlayingClient/SetNowPlayingPlayer routing selection chose the current client (not the legacy first-state fallback). */
+  get routingSelected(): boolean {
+    return this.routed;
+  }
+
+  /**
+   * Cache bypass requires a device routing selection, not the legacy first-state fallback.
+   * A selected empty client (idle TV) with no selected player is itself a definitive nothing-playing snapshot.
+   */
+  get hasSelectedSnapshot(): boolean {
+    return this.routed && (this.hasSnapshot ||
+      (this.activeClient === EMPTY_CLIENT && this.clients.get(EMPTY_CLIENT)?.active === undefined));
+  }
+
+  /** Received state for the model's current player (also the legacy first-state fallback). Identity/commands alone are not state. */
+  get hasSnapshot(): boolean {
+    const client = this.activeClient === undefined ? undefined : this.clients.get(this.activeClient);
+    const player = client?.active === null ? undefined : client?.players.get(client.active ?? DEFAULT_PLAYER);
+    return player?.hasState === true;
   }
 
   /** Fresh normalized snapshot without position extrapolation. */
@@ -59,7 +100,7 @@ export class PlayerState {
   update(type: number, payload: Payload): boolean {
     const path = payload.playerPath ?? {};
     const clientInfo = payload.client ?? path.client ?? {};
-    const bundle = clientInfo.bundleIdentifier ?? '';
+    const bundle = clientInfo.bundleIdentifier ?? EMPTY_CLIENT;
     let client = this.clients.get(bundle);
     if (!client) {
       client = { info: clientInfo, players: new Map() };
@@ -68,8 +109,10 @@ export class PlayerState {
     client.info = { ...client.info, ...clientInfo };
     const identifier = path.player?.identifier ?? DEFAULT_PLAYER;
     if (type === MessageType.SetNowPlayingClient) {
+      this.routed = true;
       this.selected = true;
-      this.activeClient = clientInfo.bundleIdentifier ? bundle : undefined;
+      // pyatv: an empty client is the EMPTY_CLIENT bundle, a normal active client with no players.
+      this.activeClient = bundle;
       return true;
     }
     if (type === MessageType.RemoveClient) {
@@ -81,6 +124,7 @@ export class PlayerState {
     if (type === MessageType.SetNowPlayingPlayer) {
       client.active = path.player?.identifier || null;
       if (!this.selected) { this.activeClient = bundle; this.selected = true; }
+      if (this.activeClient === bundle) this.routed = true;
       return this.activeClient === bundle;
     }
     if (type === MessageType.RemovePlayer) {
@@ -100,15 +144,19 @@ export class PlayerState {
     }
     if (!this.selected) { this.activeClient = bundle; this.selected = true; client.active = identifier; }
     if (type === MessageType.SetState) {
-      player.state = { ...player.state, ...payload };
+      if (carriesState(payload)) player.hasState = true;
+      for (const field of ['playbackState', 'displayName']) {
+        if (payload[field] !== undefined) player.state[field] = payload[field];
+      }
       if (payload.playbackQueue) {
-        player.items = (payload.playbackQueue.contentItems ?? []).map((item: Payload) => ({ ...item, metadata: item.metadata ? { ...item.metadata } : undefined }));
+        // Keep only what snapshots and item updates read; detach() copies bytes fields so artwork frames are not retained.
+        player.items = (payload.playbackQueue.contentItems ?? []).map((item: Payload) => ({ identifier: item.identifier, metadata: item.metadata ? detach(item.metadata) : undefined }));
         player.location = payload.playbackQueue.location ?? 0;
         // Replaced queues must not inherit metadata from a previous track.
         player.direct = {};
       }
       if (payload.nowPlayingInfo) {
-        const fields = { ...payload.nowPlayingInfo };
+        const fields = detach(payload.nowPlayingInfo);
         if (fields.uniqueIdentifier !== undefined && player.direct.uniqueIdentifier !== undefined && String(fields.uniqueIdentifier) !== String(player.direct.uniqueIdentifier)) {
           player.direct = {};
           player.items = [];
@@ -120,7 +168,7 @@ export class PlayerState {
       for (const item of payload.contentItems ?? []) {
         const existing = player.items.find(candidate => candidate.identifier === item.identifier);
         if (existing && item.metadata) {
-          const changes = { ...item.metadata };
+          const changes = detach(item.metadata);
           existing.metadata = { ...existing.metadata, ...changes };
           if (existing === player.items[player.location]) {
             for (const field of ['title', 'duration', 'elapsedTime', 'playbackRate']) {

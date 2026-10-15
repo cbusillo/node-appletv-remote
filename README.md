@@ -49,12 +49,12 @@ Credentials are saved to `~/.atv-credentials.json`. Leave out `deviceId` to use 
 
 Playback/text commands open only AirPlay/MRP; app/account/power commands and extra buttons open only Companion. `command` (alias `cmd`) still accepts `skip_forward` / `skip_backward` for the app's default interval; use the hyphenated commands to specify seconds. Extra Companion buttons are `channel_up`, `channel_down`, `screensaver`, `guide`, `page_up`, and `page_down` (not available in the MRP-only interactive remote).
 
-Numeric values must be finite decimal numbers in the documented range. Required IDs must be nonblank. Quote text to preserve spaces; `atv text set ""` explicitly sets empty text. Invalid arguments fail before reading credentials, discovery, or connection. For one-shot commands, operation and connection failures print an error to stderr and exit nonzero; one-shot operations close their connection even on failure. Absolute volume can fail if the TV does not report its output device. These commands depend on device/app support and do not bypass pairing. Extra positional arguments are rejected instead of ignored. Progress goes to stderr so app/account list and power results remain clean on stdout. Empty scans and pairing cancellation/no-device selections retain their existing successful exit behavior.
+Numeric values must be finite decimal numbers in the documented range. Required IDs must be nonblank. Quote text to preserve spaces; `atv text set ""` explicitly sets empty text. Invalid arguments fail before reading credentials, discovery, or connection. For one-shot commands, operation and connection failures print an error to stderr and exit nonzero; one-shot operations close their connection even on failure. Absolute volume can fail if the TV does not report its output device. These commands depend on device/app support and do not bypass pairing. Extra positional arguments are rejected instead of ignored. Progress (including `Requesting ...` lines from state, queue and artwork) goes to stderr so results remain clean on stdout. Empty scans and pairing cancellation/no-device selections retain their existing successful exit behavior.
 
 Two CLI timing knobs guard HID keys, which the Apple TV never acknowledges. Set either to `0` for faster one-shot commands:
 
-- `ATV_SETTLE_MS` (default 500): pause after the MRP handshake before sending anything. The library defaults to `0`; opt in with `atv.connect(credentials, { settleMs: 500 })`.
-- `ATV_POST_SEND_MS` (default 1000): pause after a one-shot key/playback/text/Companion operation, before disconnecting.
+- `ATV_SETTLE_MS` (default 500): pause after the MRP handshake before sending anything, for every MRP command (a request sent before the device is ready may be dropped; for a query that would mean waiting out its 10 s timeout). Companion-only commands do not use it. The library defaults to `0`; opt in with `atv.connect(credentials, { settleMs: 500 })`.
+- `ATV_POST_SEND_MS` (default 1000): pause after a one-shot key/playback/text/volume/Companion-button/app-launch/account-switch operation, before disconnecting. Read-only queries (`power`, `app list`, `account list`, `state`, `queue`, `artwork`) disconnect as soon as their reply arrives.
 
 ```
 $ atv state
@@ -116,23 +116,44 @@ await atv.close();
 ### Media results, state and runtime availability
 
 `play`, `pause`, `stop`, `next`, `previous`, seek, shuffle, repeat and skip commands
-wait for `SendCommandResult` (5 s timeout). Nonzero `sendError` rejects with both numeric codes; handler status is diagnostic
+wait for the reply carrying the request's identifier (5 s timeout; matched by identifier only, like pyatv).
+Nonzero `sendError` rejects with both numeric codes; handler status is diagnostic
 context, not an independent rejection gate (matching pinned pyatv). Explicit
-nonzero envelope `errorCode` also rejects; missing result status rejects
-as malformed. HID keys (including `playPause`) only report successful writes, not
+nonzero envelope `errorCode` also rejects; an absent `sendError` or an absent
+`SendCommandResult` extension both count as success (pyatv NoError). HID keys (including `playPause`) only report successful writes, not
 device acknowledgments. Correct concurrent result matching depends on the MRP
 transport's request correlation.
 
 `getNowPlaying()`, `nowPlaying` and the `nowPlaying` event share `NowPlayingInfo`.
+While connected, `getNowPlaying()` returns the received selected-player snapshot
+without sending a queue request when it has explicit playback state (including
+unknown/stopped), a queue (including an empty queue), or direct now-playing fields.
+A SetNowPlayingClient/SetNowPlayingPlayer routing selection must also have arrived
+in this connection; the legacy first-state fallback does not qualify for cache bypass.
+Client/player identity and supported commands alone do not qualify, except that a selected
+empty client (an idle TV's empty SetNowPlayingClient) with no selected player resolves as nothing playing. If no selected-player
+state has arrived, it still requests a queue reply and propagates the 10 s timeout
+or transport error. After a routing selection, a successful reply resolves with the
+selected player's snapshot (nothing playing if that player has no state), even when the
+reply lands on another player. Without a routing selection, a reply without state for the
+model's current player rejects with `No active-player state received`. It does not force a refresh
+or wait for a future push, and a push during a pending request does not hide that
+request's timeout. A successful queue reply may still establish legacy unrouted state
+for compatibility, but it must contain state for the model's current player; an
+empty/unrelated reply cannot validate an earlier unrouted push.
+`getState()` remains the raw correlated SetState queue-request API,
+even with a cached snapshot; queue and artwork calls retain their response dependency.
 Queue metadata uses its current `location`; item updates merge by identifier.
 Direct state updates retain omitted fields; a changed `uniqueIdentifier` clears
 old-track metadata. Runtime evidence is discarded on disconnect/reconnect. Inactive players stay separate until
-an active client/player message selects them. `hasPlayback` distinguishes absent
+an active client/player message selects them; an empty `SetNowPlayingClient` selects the
+empty-bundle client (as pyatv does), so an idle TV reports nothing playing. `hasPlayback` distinguishes absent
 metadata from paused/stopped playback; `playbackState` retains the device's explicit
 state (unknown if not reported). `playerIdentifier` and `appBundleIdentifier`
 identify the selected player. Position is a snapshot, not extrapolated. CLI state uses the same summary as
 `NowPlayingInfo.toString()` (percentage progress rather than its former time-pair
-formatter). The raw `playbackQueue` and `supportedCommands` events still expose
+formatter). Metadata-free explicit Playing/Paused/Interrupted/Seeking states are
+printed as their reported state, not "Absent." The raw `playbackQueue` and `supportedCommands` events still expose
 messages from any player; normalized `nowPlaying` is active-player-only.
 
 ```typescript
@@ -151,16 +172,86 @@ than being guessed from model or service presence. Availability is advisory and
 may change at any time; device errors still reject. The event has no payload:
 re-query the capabilities relevant to your application.
 
-**Apple TV HD limitation (#10):** pairing and remote keys can work while `state`,
-queue and artwork requests time out waiting for MRP type 4. A 500 ms settle delay
-has not resolved the reported AppleTV5,3 case. No HD-specific fix is established.
-Offline source comparison only establishes that pyatv reads cached pushed player
-state instead of requiring a queue response for every state read. Diagnosing the
-remaining transport/device difference needs sanitized exchanges from HD and 4K
-while playing, paused and stopped; this implementation does not fabricate that evidence.
+**Apple TV HD limitation (#10) is not solved:** pairing and remote keys can work
+while queue and artwork requests time out waiting for MRP type 4; `state` still
+has this dependency when no valid pushed snapshot exists. A 500 ms settle delay
+has not resolved the reported AppleTV5,3 case. The cache-first normalized read is
+an offline-tested improvement, not an established HD-specific fix. No firmware
+or model-based workaround is inferred.
 
-Reference: pyatv [v0.18.0, commit d88abc960e188d3cd2498d19117e75d7711d8600](https://github.com/postlund/pyatv/tree/d88abc960e188d3cd2498d19117e75d7711d8600),
-`protocols/mrp/player_state.py`, MRP result/player protobufs and runtime feature handling.
+Reference: pyatv [v0.18.0, commit d88abc960e188d3cd2498d19117e75d7711d8600](https://github.com/postlund/pyatv/tree/d88abc960e188d3cd2498d19117e75d7711d8600).
+`protocols/mrp/__init__.py:MrpMetadata.playing` reads cached player state;
+`player_state.py` merges field-present SetState updates and selects clients/players.
+`protocol.py:MrpProtocol.start` awaits ClientUpdatesConfig and GetKeyboardSession
+replies, while this library only sends them. pyatv correlates application replies
+by UUID; this library does too for media commands and the legacy heartbeat, and additionally
+requires the SetState type for queue requests. These are source
+differences, not proof of which causes #10. The handshake and strict correlation
+are unchanged pending device evidence.
+
+#### Sanitized #10 capture (operator-run only)
+
+Register `mrpDiagnostic` **before** `connect()` on an existing `AppleTV` instance.
+Import `MRPDiagnostic` as a type from `node-appletv-remote` when annotating listeners.
+Use a bounded capture connection; its in-memory token map keeps the 1024 most recently used identifiers (LRU), so recurring client/player tokens stay stable while request identifiers churn.
+The event emits only relevant init/state message types, direction, opaque
+connection-local request/client/player tokens, and `matchedRequest` on receives
+(type plus identifier match before dispatch). Missing identifiers remain omitted;
+no default route is invented. Tokens allow equality comparisons within a connection,
+not identification across devices/sessions. It excludes CryptoPairing, keys, auth
+frames, device names/addresses, keyboard text, metadata, artwork and item identifiers.
+Send entries indicate an attempt, not successful receipt by the TV. Diagnostic
+observer exceptions are reported with a fixed message, never their error content,
+and do not interrupt protocol delivery. No trace is persisted by the library. This is not a
+raw packet dump; do not share the separate `message`/`playbackQueue` payloads or logs
+from verbose auth tooling.
+
+```typescript
+// Use your own authorized device/credentials setup; never print credentials.
+const started = Date.now();
+atv.on('mrpDiagnostic', diagnostic => {
+  console.log(JSON.stringify({ ms: Date.now() - started, ...diagnostic }));
+});
+await atv.connect(credentials);
+try {
+  await new Promise(resolve => setTimeout(resolve, 2000)); // capture window, not a fix
+  try {
+    const info = await atv.getNowPlaying();
+    console.log(JSON.stringify({ operation: 'getNowPlaying', playbackState: info.playbackState,
+      hasPlayback: info.hasPlayback })); // no titles/app names
+  } catch {
+    console.log(JSON.stringify({ operation: 'getNowPlaying', result: 'rejected' }));
+    // Record locally whether this was the exact type-4 timeout; do not dump the error/payload.
+  }
+  try {
+    await atv.getState(); // explicitly compare raw queue behavior; never print the reply
+    console.log(JSON.stringify({ operation: 'getState', result: 'resolved' }));
+  } catch {
+    console.log(JSON.stringify({ operation: 'getState', result: 'rejected' }));
+  }
+} finally {
+  await atv.close();
+}
+```
+
+1. After separate hardware/credential authorization, build this checkout (`npm run build`).
+   Run the capture on HD and 4K using the same transport and app. Record model and
+   actual tvOS version manually, replacing device names/addresses with `HD`/`4K`.
+2. Use the physical remote to start, pause, then stop/exit the same test content.
+   Make a fresh connection/capture for each state on each device (six captures).
+   Also keep one connection open through those three transitions to compare pushes
+   and client/player selection. Do not use library playback commands for the capture.
+3. Compare init types 15/38/16/24, pushed state/routing types 4/46/47/53/54/55/56/72,
+   and queue type 32 followed by type 4. Check whether type 4 is absent, identifierless,
+   carries a different token, matches the request, or routes to an unselected player.
+   Record exact timeout vs other failure locally and share only sanitized outcomes.
+4. If available, repeat with pinned pyatv 0.18.0 and an equally sanitized trace;
+   never export its raw debug/auth logs. Use the comparison to test a specific
+   handshake/correlation hypothesis, not to assume a firmware difference.
+
+**Remaining blocker:** no authorized HD/4K trace establishes whether initial state
+pushes arrive, which client/player is selected, or how the failing queue response
+is identified/typed. Offline fixtures cannot establish that hardware behavior.
 
 ### Legacy Apple TV 2/3 (DMAP, experimental)
 
@@ -277,7 +368,8 @@ await atv.guide();  // also channelUp, channelDown, pageUp, pageDown, screensave
 
 Root test commands exclude nested worktrees, dependency directories and generated `dist` copies.
 
-MRP requests match the outgoing message UUID and expected response type, so concurrent
+MRP requests match the outgoing message UUID and, when one is given, the expected response type
+(media commands match by UUID only), so concurrent
 same-type replies can arrive out of order. Unsolicited updates remain visible as events;
 the DeviceInfo handshake separately accepts a type-based, identifierless response.
 HTTP/RTSP setup replies have a fixed 5-second timeout; MRP replies default to 5 seconds. RTSP replies match
@@ -293,8 +385,9 @@ classes emit `error` only when a listener exists; pending work still rejects and
 still fires without one. There is no automatic reconnect or retry.
 
 `await atv.close()` shuts down local sockets without RTSP TEARDOWN. If touch was started,
-it first cancels the gesture and attempts Companion touch/session cleanup (an unfinished touch startup is abandoned, not awaited); cleanup failure
-still closes both transports and rejects (both teardown failures are retained in an AggregateError). Without touch registrations, socket shutdown is immediate. Explicit close resets runtime availability once and notifies after both transports are cleared.
+it first cancels the gesture and attempts Companion touch/session cleanup (an unfinished touch startup is abandoned, not awaited); that cleanup
+is best-effort: failures are ignored and close still closes both transports and resolves (call `stopTouch()` first to observe
+teardown errors; both are retained there in an AggregateError). Without touch registrations, socket shutdown is immediate. Explicit close resets runtime availability once and notifies after both transports are cleared.
 Repeated close is safe. A second connect on
 an open or connecting connection rejects. Close cancels pending TCP setup as well as
 protocol waiters; await the canceled setup promise before reusing a low-level connection
@@ -355,7 +448,8 @@ atv.on('powerState', (state) => {});       // after subscribePowerState()
 atv.on('supportedCommands', (cmds) => {}); // SupportedCommand[]
 atv.on('playbackQueue', (queue) => {});
 atv.on('keyboard', (kb) => {});            // text field focused/unfocused
-atv.on('message', (msg) => {});            // every raw MRP message
+atv.on('message', (msg) => {});            // every raw MRP message; not sanitized
+atv.on('mrpDiagnostic', (d: MRPDiagnostic) => {}); // opt in before connect; safe routing tokens
 atv.on('close', () => {});
 atv.on('error', (err) => {});
 ```
@@ -389,7 +483,9 @@ src/
 
 `DiscoveredDeviceInfo.port` remains the AirPlay port, and is **0 when AirPlay is absent**. `companionPort` and `mrpPort` are independent capabilities, not substitute AirPlay ports. `mrpEnabled` is false for Darwin build 19+ (tvOS 15+), where the legacy MRP advertisement no longer indicates a usable transport. Unknown builds retain legacy MRP eligibility, matching pyatv 0.18.0.
 
-`AppleTV.connect()` and `startPairing()` preserve the AirPlay tunnel when advertised, otherwise select enabled standalone MRP. Companion-only devices use `connectCompanion()` and `startCompanionPairing()`; calling the MRP methods fails before opening a socket. Standalone credentials use the existing `Credentials` format but must be paired with the selected protocol; AirPlay pairing does not imply legacy MRP pairing. A returned PairSetup owns its open pairing carrier: always call `finish(pin)` or `destroy()`; abandoning it without either intentionally leaves pairing open.
+`AppleTV.connect()` and `startPairing()` preserve the AirPlay tunnel when advertised, otherwise select enabled standalone MRP. Companion-only devices use `connectCompanion()` and `startCompanionPairing()`; calling the MRP methods fails before opening a socket. Standalone credentials use the existing `Credentials` format but must be paired with the selected protocol; AirPlay pairing does not imply legacy MRP pairing. A returned PairSetup owns its open pairing carrier: always call `finish(pin)` or `destroy()`; abandoning it without either intentionally leaves pairing open. `PairSetup.clientId` is a public readonly controller pairing identifier (a random UUID per instance); it is sent in M5 and returned as `clientId` in the finished credentials.
+
+A standalone MRP connection sends a heartbeat (a GenericMessage) every 30 s, never overlapping another. Any reply carrying the request's identifier counts, whatever its type; a miss is retried once immediately, and a second miss fails the connection (pyatv HEARTBEAT_RETRIES=1).
 
 Discovery associates modern services by compatible advertised identity, primary-protocol hostname, or overlapping primary-protocol addresses, never by display name. AirPlay `deviceid` and MRP `macAddress` share a MAC namespace; MRP `UniqueIdentifier` and Companion `rpMRtID` share an MRP namespace. Other cross-protocol ID equality does not establish an association. Conflicting IDs within a namespace keep devices separate. Same-protocol records with disjoint addresses and different SRV hosts remain separate even when their IDs match; duplicate device IDs are ambiguous, not verified identities. Primary endpoint overlap is scoped to the selected protocol host. Records matching multiple groups remain separate instead of bridging them, independent of arrival order; an ambiguous result must not be treated as a verified TV.
 
