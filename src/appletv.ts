@@ -190,9 +190,11 @@ export class AppleTV extends EventEmitter {
 
   /** Open the AirPlay/MRP connection with stored credentials; emits `connect` once ready. */
   async connect(credentials: Credentials, options: ConnectOptions = {}): Promise<void> {
-    this.connection = new AirPlayConnection(this.address, this.port, credentials, options.settleMs);
+    this.connection = new AirPlayConnection(this.address, this.port, credentials, { settleMs: options.settleMs });
     this.connection.on('close', () => this.emit('close'));
-    this.connection.on('error', (err) => this.emit('error', err));
+    // The failure that ends the connection also rejects connect() and pending requests,
+    // so it is only re-emitted to listeners rather than thrown as an unhandled 'error'.
+    this.connection.on('error', (err) => { if (this.listenerCount('error')) this.emit('error', err); });
     this.connection.on('mrp-message', (msg: Record<string, unknown>) => {
       this.handleMRPMessage(msg);
     });
