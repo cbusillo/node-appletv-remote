@@ -85,6 +85,21 @@ describe('RaopStream AirPlay 2 realtime profile', () => {
     expect(sealed.calls).toBeGreaterThan(0);
     expect(sealed.key!.every(byte => byte === 0)).toBe(true);
   }, 10000);
+  it('sends progress and JPEG artwork before encrypted RECORD with the first RTP time', async () => {
+    const { receiver, stream } = await start();
+    controlledClock.now = 0; vi.spyOn(performance, 'now').mockImplementation(() => controlledClock.now!);
+    await stream.stream(Buffer.alloc(4), {
+      credentials: receiver.credentials, duration: 1 / 44100, metadata: { artwork: Buffer.from([0xff, 0xd8, 0xff, 1]) },
+    });
+    const requests = receiver.requests.filter(request => request.uri !== '/feedback');
+    expect(requests.map(request => request.method)).toEqual(['POST', 'POST', 'SETUP', 'SETUP', 'SET_PARAMETER', 'SET_PARAMETER', 'RECORD', 'FLUSH', 'TEARDOWN']);
+    expect(requests[4]).toMatchObject({ headers: { 'content-type': 'text/parameters', session: '0' } });
+    expect(requests[4].body.toString()).toBe('progress: 66150/66150/66151\r\n');
+    expect(requests[4].headers['rtp-info']).toMatch(/^seq=\d+;rtptime=66150$/);
+    expect(requests[5]).toMatchObject({ headers: { 'content-type': 'image/jpeg', session: '0' }, body: Buffer.from([0xff, 0xd8, 0xff, 1]) });
+    expect(requests[5].headers['rtp-info']).toMatch(/^seq=\d+;rtptime=66150$/);
+  }, 10000);
+
 
   it('accepts a receiver-chosen Audio-Latency on RECORD', async () => {
     const { receiver, stream } = await start({ recordLatency: '11025' });

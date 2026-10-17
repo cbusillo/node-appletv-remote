@@ -1,6 +1,6 @@
 # Plan: remaining RAOP / AirPlay 2 audio work (#22)
 
-Status: **plan only, awaiting approval.** No implementation code is part of this change.
+Status: historical plan. Task 13 is implemented in #80; H4 receiver display verification remains open.
 
 ## Where we are
 
