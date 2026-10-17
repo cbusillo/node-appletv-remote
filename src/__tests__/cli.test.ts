@@ -176,6 +176,13 @@ describe('CLI operations', () => {
     await expect(run(['power'])).rejects.toThrow('connect failed');
     expect(AppleTV.prototype.close).toHaveBeenCalledTimes(1);
   });
+  it('passes repeated targeted scan hosts and rejects malformed values before scan I/O', async () => {
+    vi.mocked(scan).mockResolvedValue([]);
+    await run(['scan', '--host', '192.0.2.8', '--host', '2001:db8::8']);
+    expect(scan).toHaveBeenCalledWith({ timeout: 5000, hosts: ['192.0.2.8', '2001:db8::8'] });
+    await expect(run(['scan', '--host', 'not-an-ip'])).rejects.toThrow('Invalid discovery host');
+    expect(scan).toHaveBeenCalledTimes(1);
+  });
   it('shows help without a connection', async () => {
     await run(['--help']);
     expect(console.log).toHaveBeenCalledWith(expect.stringContaining('seek'));

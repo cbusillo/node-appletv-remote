@@ -7,6 +7,7 @@
  * in ~/.atv-dmap.json.
  */
 import { scan, normalizeTxt, type DiscoveredDeviceInfo } from '../discovery.js';
+import { parseTargets } from '../targeted-mdns.js';
 import { setTimeout as delay } from 'node:timers/promises';
 import { AppleTV, Key, ShuffleState, RepeatState, contentItems, INPUT_ACTIONS } from '../appletv.js';
 import { PlaybackState } from '../now-playing-info.js';
@@ -79,9 +80,10 @@ function saveStored(file: string, id: string, value: string): void {
 }
 
 /** `atv scan`: list Apple TVs and AirPlay receivers found via mDNS within 5 s, with each `psi` output ID. */
-async function cmdScan() {
+async function cmdScan(hosts: string[]) {
+  parseTargets(hosts);
   console.log('Scanning for Apple TVs...');
-  const devices = await scan({ timeout: 5000 });
+  const devices = await scan({ timeout: 5000, hosts });
   if (devices.length === 0) {
     console.log('No Apple TVs found.');
     return;
@@ -568,7 +570,8 @@ async function cmdRaopStream(address: string, file: string) {
 /** Print the CLI syntax; no discovery or credential loading occurs. */
 function help(): void {
   console.log(`Usage:
-  atv scan | pair | companion-pair
+  atv scan [--host <ip>]...         # find Apple TVs; query known mDNS hosts directly too
+  atv pair | companion-pair
   atv command <key> [action] [device]  Send an MRP key or Companion button (alias: cmd);
                                        action: singleTap (default), doubleTap, hold
                                        (case-insensitive)
@@ -745,9 +748,17 @@ export async function main(argv: string[]): Promise<void> {
       } else throw new Error(`Invalid ${cmd} operation: ${action ?? '(missing)'}`);
       break;
     }
-    case 'scan': case 'pair': case 'companion-pair':
+    case 'scan': {
+      const hosts: string[] = [];
+      for (let index = 0; index < args.length; index += 2) {
+        if (args[index] !== '--host' || args[index + 1] === undefined) throw new Error('Usage: atv scan [--host <ip>]...');
+        hosts.push(args[index + 1]);
+      }
+      return cmdScan(hosts);
+    }
+    case 'pair': case 'companion-pair':
       if (args.length) throw new Error(`Usage: atv ${cmd}`);
-      return cmd === 'scan' ? cmdScan() : cmd === 'pair' ? cmdPair() : cmdCompanionPair();
+      return cmd === 'pair' ? cmdPair() : cmdCompanionPair();
     case 'remote': case 'state': case 'queue': case 'messages': case 'keyboard': case 'companion-test':
       argumentsFor(args, 0, `${cmd} [device]`);
       switch (cmd) {

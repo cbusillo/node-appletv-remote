@@ -3,7 +3,7 @@
 Every `atv` command, its arguments, and how it picks a device. `atv --help` prints the same syntax.
 
 ```bash
-atv scan                          # find Apple TVs (and AirPlay receivers' psi output IDs)
+atv scan [--host <ip>]...           # also query each known host's mDNS endpoint directly
 atv pair                          # AirPlay pairing (enter the PIN shown on the TV)
 atv companion-pair                # Companion pairing, needed for apps/accounts/power
 
@@ -51,6 +51,13 @@ atv raop-stream 192.168.1.20 track.pcm  # raw PCM16LE stereo 44.1 kHz, no WAV he
 ```
 
 Credentials are saved to `~/.atv-credentials.json`. Leave out `deviceId` to use the most recently paired device. An explicit selector matches a paired device ID case-insensitively; blank or unmatched selectors fail instead of silently selecting the last device. Each device's last working address is cached in `~/.atv-devices.json`, so commands skip the network scan. If the TV has moved, the CLI rescans automatically; an address that silently drops packets fails over after a 5 s connect timeout rather than the OS TCP timeout (about 75 s on macOS).
+
+`atv scan --host <ip>` is repeatable and retains ordinary multicast browsing. Each value must be
+a nonempty IP literal; an IPv6 link-local address needs its interface scope (for example,
+`fe80::1234%en0`) and is preserved. Targeted scan sends DNS-SD mDNS packets to UDP port 5353,
+not recursive DNS, so routing, firewalls, NAT, and client isolation can still prevent discovery.
+It is unauthenticated and does not establish reachability, wake/trust state, or device identity:
+pair normally and rely on cryptographic connection verification before trusting a result.
 
 Playback and output commands open only AirPlay/MRP; text/app/account/power/click/swipe commands and extra buttons open only Companion. `command` (alias `cmd`) still accepts `skip_forward` / `skip_backward` for the app's default interval; use the hyphenated commands to specify seconds. Extra Companion buttons are `channel_up`, `channel_down`, `screensaver`, `guide`, `page_up`, and `page_down` (not available in the MRP-only interactive remote). An optional action (`singleTap`, `doubleTap`, `hold`; case-insensitive) may follow navigation/HID keys and Companion buttons; media keys, `wake`, `suspend`, skips and `home_hold` reject it before connecting. When both an action and a device are given, an unrecognized action word is rejected as an invalid action instead of being treated as a device selector.
 
