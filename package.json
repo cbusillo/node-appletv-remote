@@ -48,6 +48,7 @@
     "bplist-creator": "^0.1.1",
     "bplist-parser": "^0.5.0",
     "fast-srp-hap": "^2.0.4",
+    "music-metadata": "^11.16.1",
     "protobufjs": "^8.8.1"
   },
   "devDependencies": {
