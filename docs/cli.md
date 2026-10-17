@@ -49,7 +49,11 @@ atv dmap play [deviceId]          # up down left right select menu top_menu play
 atv dmap state [deviceId]         # title, artist, album, play state
 
 # Legacy RAOP audio (experimental; see audio-and-playback.md)
-atv raop-stream 192.168.1.20 track.pcm  # raw PCM16LE stereo 44.1 kHz, no WAV header
+atv raop-stream 192.168.1.20 track.pcm       # raw PCM16LE stereo 44.1 kHz
+atv raop-stream 192.168.1.20 track.wav       # matching PCM16 stereo 44.1 kHz WAV
+atv raop-stream 192.168.1.20 track.flac      # ffmpeg decodes and resamples other files
+atv raop-stream 192.168.1.20 https://example.test/track.mp3
+atv raop-stream 192.168.1.20 pcm:https://example.test/track.pcm # explicit remote raw PCM
 ```
 
 Credentials, protocol settings, DMAP GUIDs and nonsecret endpoint hints use
@@ -88,7 +92,7 @@ unpublish the advertisement. `atv dmap` logs in with that GUID, applies DMAP end
 settings over cached hints and uses the same selector rules. `state` is a one-shot
 snapshot; the CLI does not start DMAP push polling.
 
-`atv raop-stream` resolves the receiver's `_raop._tcp` TXT record by browsing mDNS for up to five seconds at the given IPv4 address, then streams the file with `RaopStream`. It supports only receivers that accept unencrypted legacy PCM without a PIN (receivers requiring a legacy seed, password or HAP fail before streaming). Ctrl+C cancels and tears the session down.
+`atv raop-stream` resolves the receiver's `_raop._tcp` TXT record by browsing mDNS for up to five seconds at the given IPv4 address, then streams finite input with `RaopStream`. Local `.pcm` is already raw PCM16LE stereo 44.1 kHz; a matching `.wav` is read directly. Other local files, incompatible or malformed WAV files, and ordinary HTTP(S) URLs are decoded and resampled by an installed `ffmpeg` executable (`-f s16le -ar 44100 -ac 2`). The command fails before discovery with a PCM/WAV alternative if `ffmpeg` is missing. It does not infer remote raw PCM from MIME type: prefix an HTTP(S) raw PCM URL with `pcm:` explicitly. Remote sources are finite downloads, not live-radio streams, and no track is prebuffered. It supports only receivers that accept unencrypted legacy PCM without a PIN (receivers requiring a legacy seed, password or HAP fail before streaming). Ctrl+C cancels the source/decoder and tears the session down; a decoder/source failure after PCM has begun is reported rather than retried.
 
 Numeric values must be finite decimal numbers in the documented range. Required IDs must be nonblank. Quote text to preserve spaces; `atv text set ""` explicitly sets empty text. Invalid arguments fail before reading credentials, discovery, or connection. For one-shot commands, operation and connection failures print an error to stderr and exit nonzero; one-shot operations close their connection even on failure. Absolute volume can fail if the TV does not report its output device, and has no effect when the TV offers only relative or no volume control (see #39 in [library.md](library.md#media-results-state-and-runtime-availability)). These commands depend on device/app support and do not bypass pairing. Extra positional arguments are rejected instead of ignored. Progress (including `Requesting ...` lines from state, queue and artwork) goes to stderr so results remain clean on stdout. Empty scans and pairing cancellation/no-device selections retain their existing successful exit behavior.
 

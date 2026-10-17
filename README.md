@@ -84,7 +84,7 @@ Other models and tvOS versions are untested; reports are welcome.
 | Volume | MRP capability reporting verified; Companion control/reading unverified |
 | Audio output routing | Add/remove verified; `setOutputDevices` and routing errors unverified (#46) |
 | IPv6 (global, ULA, link-local) | Verified for MRP and Companion |
-| AirPlay 2 audio streaming (`RaopStream`) | Verified, incl. WAV input and volume; text metadata not shown on screen (#22) |
+| AirPlay 2 audio streaming (`RaopStream`) | Verified, incl. WAV input and volume; CLI ffmpeg decoding/remote input unverified on receiver hardware; text metadata not shown on screen (#22) |
 | Text entry and text-focus events | Unverified |
 | Media URL and temporary local-file playback | Unverified |
 | Legacy Apple TV 2/3 (DMAP), legacy RAOP receivers, HomePods | Unverified, no hardware available |

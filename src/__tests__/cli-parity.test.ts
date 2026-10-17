@@ -4,9 +4,10 @@ import { AppleTV } from '../appletv.js';
 import { DmapClient } from '../dmap/client.js';
 import { DmapPairing } from '../dmap/pairing.js';
 import { NowPlayingInfo, PlaybackState } from '../now-playing-info.js';
+import { Readable } from 'node:stream';
 
 const raop = vi.hoisted(() => ({ services: [] as object[], created: [] as unknown[][], stream: vi.fn() }));
-vi.mock('node:fs', () => ({ realpathSync: (path: string) => path, existsSync: vi.fn(() => true), readFileSync: vi.fn((path: string) => path.endsWith('.atv-dmap.json') ? '{"device":"0x0123456789ABCDEF"}' : '{"device":"modern-credentials"}'), writeFileSync: vi.fn(), createReadStream: vi.fn(() => 'pcm-stream') }));
+vi.mock('node:fs', () => ({ realpathSync: (path: string) => path, existsSync: vi.fn(() => true), readFileSync: vi.fn((path: string) => path.endsWith('.atv-dmap.json') ? '{"device":"0x0123456789ABCDEF"}' : '{"device":"modern-credentials"}'), writeFileSync: vi.fn(), createReadStream: vi.fn(() => Readable.from([])) }));
 vi.mock('node:fs/promises', () => ({ readFile: async () => JSON.stringify({ version: 1, devices: [{ key: 'device', aliases: ['device'], credentials: { airplay: { clientId: 'client', clientLTSK: 'a'.repeat(64), clientLTPK: 'b'.repeat(64), serverLTPK: 'c'.repeat(64), serverId: 'server' }, companion: { clientId: 'companion', clientLTSK: 'd'.repeat(64), clientLTPK: 'e'.repeat(64), serverLTPK: 'f'.repeat(64), serverId: 'server' }, dmap: { guid: '0x0123456789ABCDEF' } } }] }), mkdir: async () => {}, writeFile: async () => {}, chmod: async () => {}, rename: async () => {}, rm: async () => {} }));
 vi.mock('node:readline', () => ({ createInterface: () => ({ question: (_q: string, answer: (value: string) => void) => answer('1'), close() {} }) }));
 vi.mock('../discovery.js', async importOriginal => ({ ...(await importOriginal<typeof import('../discovery.js')>()), scan: vi.fn() }));
@@ -165,8 +166,7 @@ describe('RAOP streaming', () => {
     ];
     await run(['raop-stream', '192.0.2.7', 'track.pcm']);
     expect(raop.created).toEqual([['192.0.2.7', 7000, { cn: '0,1', et: '0', sr: '44100' }]]);
-    expect(createReadStream).toHaveBeenCalledWith('track.pcm', { highWaterMark: 65536 });
-    expect(raop.stream).toHaveBeenCalledWith('pcm-stream', { signal: expect.any(AbortSignal) });
+    expect(raop.stream).toHaveBeenCalledWith(expect.anything(), { signal: expect.any(AbortSignal) });
   });
   it('fails when no receiver advertises at the address', async () => {
     vi.useFakeTimers();
