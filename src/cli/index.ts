@@ -817,9 +817,9 @@ function playbackData(info: NowPlayingInfo): Record<string, unknown> {
     hasPlayback: info.hasPlayback, playerIdentifier: info.playerIdentifier || null,
     title: info.title || null, artist: info.artist || null, album: info.album || null,
     genre: info.genre || null,
-    duration: Number.isFinite(info.duration) ? info.duration : null,
-    elapsedTime: Number.isFinite(info.elapsedTime) ? info.elapsedTime : null,
-    playbackRate: Number.isFinite(info.playbackRate) ? info.playbackRate : null,
+    duration: info.hasDuration ? info.duration : null,
+    elapsedTime: info.hasElapsedTime ? info.elapsedTime : null,
+    playbackRate: info.hasPlaybackRate ? info.playbackRate : null,
     playbackState: states[info.playbackState] ?? 'unknown',
     appDisplayName: info.appDisplayName || null, appBundleIdentifier: info.appBundleIdentifier || null,
   };

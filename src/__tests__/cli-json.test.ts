@@ -52,7 +52,15 @@ it('preserves zero-valued normalized playback and the resolved ID for a partial 
   ));
   await main(['state', '--json', 'DEV']);
   expect(records()).toMatchObject([{ type: 'result', command: 'state', deviceId: 'device',
-    data: { hasPlayback: true, title: 'Song', playbackState: 'paused', elapsedTime: 0, playbackRate: 0 } }]);
+    data: { hasPlayback: true, title: 'Song', playbackState: 'paused', duration: null, elapsedTime: 0, playbackRate: 0 } }]);
+});
+
+it('does not promote missing or nonfinite timing to zero in a reported playback update', async () => {
+  vi.spyOn(AppleTV.prototype, 'getNowPlaying').mockResolvedValue(new NowPlayingInfo(
+    { hasPlayback: true }, { title: 'Song', elapsedTime: NaN, playbackRate: Infinity },
+  ));
+  await main(['--json', 'state']);
+  expect(records()).toMatchObject([{ data: { title: 'Song', duration: null, elapsedTime: null, playbackRate: null } }]);
 });
 
 it('emits only stable scalar queue metadata, not binary or raw protocol fields', async () => {

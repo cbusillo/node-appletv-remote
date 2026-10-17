@@ -68,6 +68,55 @@ State events may coalesce if stdout is slow. The backlog is bounded to 128 recor
 
 Interactive pairing/prompts, raw diagnostic streams (`messages`, `keyboard`, and `companion-test`), DMAP, and RAOP streaming are rejected in JSON mode before network I/O. JSON error data contains a stable `code` and safe `message`; protocol numeric codes are retained when present, but stacks, credentials, raw payloads, and private keys are never emitted.
 
+The following examples show the `data` object inside the common result envelope.
+Action rows include every supported alias/subcommand; request rejection produces an
+`error` instead of the success object. Empty lists retain the same array shape.
+
+| Command | Example `data` |
+|---|---|
+| `help`, `--help`, `-h` | `{"schemaVersion":1}` |
+| `scan` | `{"devices":[{"id":"tv","name":"TV","address":"192.0.2.1","port":7000,"model":"AppleTV14,1","psi":null}]}` |
+| `state` | `{"hasPlayback":true,"playerIdentifier":null,"title":"Song","artist":null,"album":null,"genre":null,"duration":null,"elapsedTime":0,"playbackRate":0,"playbackState":"paused","appDisplayName":null,"appBundleIdentifier":null}` |
+| `queue` | `{"items":[{"id":"track","title":"Song","artist":"Artist","album":"Album"}]}` |
+| `artwork` | `{"path":"cover.jpg","bytes":1234,"available":true}` |
+| `command up`, `cmd up` | `{"command":"up","action":"singleTap","acknowledged":false}` |
+| `command play`, `command guide` (representative correlated media/Companion buttons) | `{"command":"play","action":"singleTap","acknowledged":true}` (the command field echoes the actual key) |
+| `stop`, `seek`, `skip-forward`, `skip-backward`, `shuffle`, `repeat` | `{"acknowledged":true}` |
+| `volume`, `click`, `swipe` | `{"acknowledged":false}` |
+| `output list`, `output add`, `output remove`, `output set` | `{"items":[{"id":"psi-uuid","name":"Speaker"}],"acknowledged":true}` |
+| `app list`, `account list` | `{"items":[{"id":"identifier","name":"Display name"}],"acknowledged":true}` |
+| `app launch`, `account switch` | `{"acknowledged":true}` |
+| `power` | `{"value":"on","acknowledged":true}` (`on`, `off`, `unknown`) |
+| `text focus` | `{"value":"unfocused","acknowledged":true}` (`focused`, `unfocused`, `unknown`) |
+| `text set`, `text append`, `text clear` | `{"value":"resulting text","acknowledged":false}` (`clear` returns an empty string) |
+
+Watch records have `type: "event"` and the event name in `command`. State sources
+can be absent independently; a Companion-only watch does not fabricate MRP state.
+
+| Event | Example `data` |
+|---|---|
+| `connection` | `{"transport":"companion","state":"connected"}` (transport is `mrp` or `companion`) |
+| `source` | `{"source":"mrp","state":"unavailable"}` |
+| `playback` | `{"state":"unknown"}` before observation; afterward the same data shape as `state` above |
+| `volume` | `{"value":32.5,"state":"known"}`; otherwise `value: null` with `state: "unknown"` or `"unavailable"` |
+| `output-devices` | `{"devices":[{"id":"psi-uuid","name":"Speaker"}],"state":"known"}`; unobserved devices are `null`, not an invented empty array |
+| `power` | `{"state":"off"}`; absent Companion reports `{"state":"unknown","available":false}` |
+| `text-focus` | `{"state":"focused"}`; initially `"unknown"` until observed; an unavailable provider has `available: false` |
+| `connection-error` | `{"code":"protocol_error","message":"Device rejected the operation","protocolCode":7}` |
+| `connection-close` | `{"intentional":false,"transport":"companion"}` |
+| `watch-close` | `{"reason":"signal","signal":"SIGINT","intentional":true}` |
+
+Playback states are `unknown`, `playing`, `paused`, `stopped`, `interrupted`, and
+`seeking`. Power and focus use the strings shown above. One-shot `error` records
+use the same safe data shape as `connection-error`; stable codes are
+`invalid_arguments`, `unsupported`, `credentials_unavailable`, `text_unfocused`,
+`protocol_error`, `transport_error`, `operation_failed`, `output_limit`, and
+`cancelled`. Signal cancellation additionally includes `signal`. Successful
+one-shots exit 0; failures, transport loss and output failure exit 1; SIGINT and
+SIGTERM exit 130 and 143. A dead output pipe cannot deliver a terminal JSON record,
+but still tears down the command and exits nonzero.
+
+
 
 Credentials are saved to `~/.atv-credentials.json`. Leave out `deviceId` to use the most recently paired device. An explicit selector matches a paired device ID case-insensitively; blank or unmatched selectors fail instead of silently selecting the last device. Each device's last working address is cached in `~/.atv-devices.json`, so commands skip the network scan. If the TV has moved, the CLI rescans automatically; an address that silently drops packets fails over after a 5 s connect timeout rather than the OS TCP timeout (about 75 s on macOS).
 
