@@ -237,10 +237,13 @@ be finite and non-negative. Both methods reject outside an active session.
 
 `extractRaopMetadata(file, explicitMetadata?)` uses the ESM-only `music-metadata` parser for a
 finite local file and returns `{ metadata, duration }`; explicit metadata fields override embedded
-title, artist, album, or artwork. Covers are skipped by the general parser to bound memory. Bounded
-readers select one valid JPEG from ID3v2 (MP3), raw JPEG cover payloads in FLAC, MP4/M4A, and RIFF/WAV
-containers, or a Vorbis/Opus `METADATA_BLOCK_PICTURE` header comment; each reader skips non-cover
-content and retains no more than 1 MiB. Parser failures are returned to the caller; no path, tag, or
+title, artist, album, or artwork. Covers are skipped by the general parser to bound memory.
+Format-specific readers inspect declared ID3v2.3/v2.4 APIC frames, FLAC PICTURE blocks,
+MP4/M4A `covr/data` atoms, RIFF/WAV ID3 chunks, and Vorbis/Opus
+`METADATA_BLOCK_PICTURE` header comments. They never search audio payloads for JPEG signatures.
+Returned artwork is capped at 1 MiB; individual metadata buffers are capped at 2 MiB,
+with fixed record, nesting, and Ogg-page limits. Oversized or unsupported covers are omitted.
+Parser failures are returned to the caller; no path, tag, or
 artwork is logged. This extraction is independent of audio input: it does not decode, transcode,
 inspect raw PCM, or fetch remote files.
 
