@@ -54,3 +54,37 @@ it('rejects prompt and raw diagnostic commands before connection', async () => {
   expect(record()).toMatchObject({ type: 'error', command: 'pair', data: { code: 'unsupported' } });
   expect(AppleTV.prototype.connect).not.toHaveBeenCalled();
 });
+
+it('streams initial unknown snapshots, normalized changes, and one loss terminal record', async () => {
+  let connected: (() => void) | undefined;
+  let tv: AppleTV | undefined;
+  vi.spyOn(AppleTV.prototype, 'connect').mockImplementation(function (this: AppleTV) {
+    tv = this;
+    return new Promise<void>((resolve) => { connected = resolve; });
+  });
+  const watching = main(['--json', 'watch', 'device']);
+  await vi.waitFor(() => expect(connected).toBeTypeOf('function'));
+  connected!();
+  await Promise.resolve();
+  await Promise.resolve();
+  tv!.emit('nowPlaying', new NowPlayingInfo({ hasPlayback: true, playbackState: PlaybackState.Paused }, { title: 'Changed' }));
+  tv!.emit('volume', 32.5);
+  tv!.emit('close');
+  await watching;
+  const records = lines.join('').trim().split('\n').map((line) => JSON.parse(line) as Record<string, unknown>);
+  expect(records.map((entry) => entry.command)).toEqual([
+    'connection', 'playback', 'volume', 'output-devices', 'source', 'playback', 'volume', 'connection-close',
+  ]);
+  expect(records[1]).toMatchObject({ type: 'event', data: { playbackState: 'unknown' } });
+  expect(records[5]).toMatchObject({ type: 'event', data: { title: 'Changed', playbackState: 'paused' } });
+  expect(records[7]).toMatchObject({ type: 'event', data: { intentional: false, transport: 'mrp' } });
+  expect(process.exitCode).toBe(1);
+  expect(AppleTV.prototype.close).toHaveBeenCalled();
+});
+
+it('suppresses EPIPE from a closed JSON stdout consumer', async () => {
+  vi.mocked(scan).mockResolvedValue([]);
+  const error = Object.assign(new Error('broken pipe'), { code: 'EPIPE' });
+  vi.spyOn(process.stdout, 'write').mockImplementation(() => { throw error; });
+  await expect(main(['--json', 'scan'])).resolves.toBeUndefined();
+});
