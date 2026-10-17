@@ -25,6 +25,7 @@ import { withCachedDevice } from './device-cache.js';
 import { createInterface } from 'node:readline';
 import type { Message } from '../message.js';
 import type { KeyboardInfo, TextInputEvent, CompanionEvent, App, UserAccount, InputAction } from '../appletv.js';
+import type { NowPlayingInfo } from '../now-playing-info.js';
 
 /** Where paired credentials are stored (falls back to the current directory if HOME is unset). */
 const CREDS_FILE = join(process.env.HOME ?? '.', '.atv-credentials.json');
@@ -230,18 +231,18 @@ const COMPANION_BUTTONS = {
  * sending fails. Only HID keys and Companion buttons accept an action; media keys, wake/suspend,
  * skips and `home_hold` are rejected before connecting.
  */
-async function cmdCommand(command: string, action?: InputAction, deviceId?: string) {
+async function cmdCommand(command: string, action?: InputAction, deviceId?: string, json = false): Promise<Record<string, unknown> | void> {
   const button = Object.hasOwn(COMPANION_BUTTONS, command)
     ? COMPANION_BUTTONS[command as keyof typeof COMPANION_BUTTONS] : undefined;
   if (!button && !COMMAND_SET.has(command)) throw new Error(`Unknown command: ${command}. Run "atv --help".`);
   if (action && !button && !HID_KEY_MAP[command]) throw new Error(`Action modes are not supported for ${command}`);
   const atv = await (button ? connectToCompanion(deviceId) : connectToDevice(deviceId));
   try {
-    // An undefined action takes each method's 'singleTap' default.
     if (button) await atv[button](action);
     else await atv.sendKeyCommand(command as Key, action);
-    console.log(`Sent: ${command}`);
+    if (!json) console.log(`Sent: ${command}`);
     await delay(postSendMs());
+    return json ? { acknowledged: false, command, action: action ?? 'singleTap' } : undefined;
   } finally {
     await atv.close();
   }
@@ -290,11 +291,12 @@ async function cmdRemote(deviceId?: string) {
 }
 
 /** `atv state [device]`: print title, artist, album, play state, progress, and app for the current item. */
-async function cmdState(deviceId?: string) {
+async function cmdState(deviceId?: string, json = false): Promise<Record<string, unknown> | void> {
   const atv = await connectToDevice(deviceId);
   try {
     console.error('Requesting state...');
     const info = await atv.getNowPlaying();
+    if (json) return playbackData(info);
     const stopped = info.playbackState === PlaybackState.Stopped;
     const idle = !info.hasPlayback && (stopped || info.playbackState === PlaybackState.Unknown);
     console.log(idle ? `Nothing playing. [${stopped ? 'Stopped' : 'Absent'}]` : info.toString());
@@ -304,32 +306,27 @@ async function cmdState(deviceId?: string) {
 }
 
 /** `atv queue [device]`: print up to 20 items from the playback queue. */
-async function cmdQueue(deviceId?: string) {
+async function cmdQueue(deviceId?: string, json = false): Promise<Record<string, unknown> | void> {
   const atv = await connectToDevice(deviceId);
   try {
     console.error('Requesting playback queue...');
-    const response = await atv.requestPlaybackQueue({
-      location: 0,
-      length: 20,
-      includeMetadata: true,
-    });
+    const response = await atv.requestPlaybackQueue({ location: 0, length: 20, includeMetadata: true });
     const items = contentItems(response);
+    if (json) return { items };
     if (items.length > 0) {
       items.forEach((item, i) => {
         const metadata = item.metadata as Record<string, unknown> | undefined;
         const title = metadata?.title ?? item.identifier ?? '(unknown)';
         console.log(`  ${i + 1}. ${title}`);
       });
-    } else {
-      console.log('No items in playback queue.');
-    }
+    } else console.log('No items in playback queue.');
   } finally {
     await atv.close();
   }
 }
 
 /** `atv artwork [device] [file]`: save 600x600 now-playing artwork (default artwork.jpg). */
-async function cmdArtwork(deviceId?: string, outputFile?: string) {
+async function cmdArtwork(deviceId?: string, outputFile?: string, json = false): Promise<Record<string, unknown> | void> {
   const atv = await connectToDevice(deviceId);
   try {
     console.error('Requesting artwork...');
@@ -337,10 +334,10 @@ async function cmdArtwork(deviceId?: string, outputFile?: string) {
     if (artwork) {
       const filename = outputFile ?? 'artwork.jpg';
       writeFileSync(filename, artwork);
+      if (json) return { path: filename, bytes: artwork.length, available: true };
       console.log(`Artwork saved to ${filename} (${artwork.length} bytes)`);
-    } else {
-      console.log('No artwork available.');
-    }
+    } else if (json) return { available: false };
+    else console.log('No artwork available.');
   } finally {
     await atv.close();
   }
@@ -598,6 +595,8 @@ function help(): void {
   atv dmap <command|state> [device]    Legacy DMAP control: ${Object.keys(DMAP_COMMANDS).join(', ')}
   atv raop-stream <ipv4> <file.pcm>    Experimental: stream raw PCM16LE stereo 44.1 kHz to a legacy
                                        RAOP receiver (no WAV header, no PIN/HAP receivers)
+  atv --json <command> ...          Emit versioned JSON Lines (supports watch [device])
+  atv watch [device]                Stream normalized state until interrupted
   atv remote | state | queue | messages | keyboard | companion-test [device]
   atv artwork [device] [output.jpg]
   atv help | --help | -h
@@ -624,8 +623,196 @@ function numberArgument(value: string, min: number, max = Infinity, positive = f
   return number;
 }
 
+const JSON_VERSION = 1;
+
+type JsonRecord = {
+  version: typeof JSON_VERSION;
+  type: 'result' | 'event' | 'error';
+  command: string;
+  timestamp: string;
+  deviceId?: string;
+  data: Record<string, unknown>;
+};
+
+/**
+ * Writes complete JSON lines without changing console. State updates may replace an older queued
+ * update of the same kind; terminal records are never coalesced or discarded.
+ */
+class JsonLineWriter {
+  private queue: { record: JsonRecord; key?: string }[] = [];
+  private writing = false;
+  private closed = false;
+  private readonly limit = 128;
+
+  write(record: JsonRecord, key?: string): void {
+    if (this.closed) return;
+    if (key) {
+      const existing = this.queue.find((entry) => entry.key === key);
+      if (existing) { existing.record = record; return; }
+    }
+    if (this.queue.length >= this.limit && key) return;
+    this.queue.push({ record, key });
+    void this.drain();
+  }
+
+  private async drain(): Promise<void> {
+    if (this.writing) return;
+    this.writing = true;
+    try {
+      while (this.queue.length && !this.closed) {
+        const { record } = this.queue.shift()!;
+        try {
+          if (!process.stdout.write(`${JSON.stringify(record)}\n`)) {
+            await new Promise<void>((resolve) => process.stdout.once('drain', resolve));
+          }
+        } catch (error: unknown) {
+          if ((error as NodeJS.ErrnoException).code === 'EPIPE') this.closed = true;
+          else throw error;
+        }
+      }
+    } finally {
+      this.writing = false;
+    }
+  }
+
+  async finish(): Promise<void> {
+    await this.drain();
+  }
+
+  close(): void { this.closed = true; this.queue = []; }
+}
+
+function jsonRecord(type: JsonRecord['type'], command: string, data: Record<string, unknown>, deviceId?: string): JsonRecord {
+  return { version: JSON_VERSION, type, command, timestamp: new Date().toISOString(), ...(deviceId ? { deviceId } : {}), data };
+}
+
+function playbackData(info: NowPlayingInfo): Record<string, unknown> {
+  const states: Record<number, string> = {
+    [PlaybackState.Unknown]: 'unknown', [PlaybackState.Playing]: 'playing',
+    [PlaybackState.Paused]: 'paused', [PlaybackState.Stopped]: 'stopped',
+    [PlaybackState.Interrupted]: 'interrupted', [PlaybackState.Seeking]: 'seeking',
+  };
+  return {
+    hasPlayback: info.hasPlayback, playerIdentifier: info.playerIdentifier || null,
+    title: info.title || null, artist: info.artist || null, album: info.album || null,
+    genre: info.genre || null, duration: info.duration || null, elapsedTime: info.elapsedTime || null,
+    playbackRate: info.playbackRate || null, playbackState: states[info.playbackState] ?? 'unknown',
+    appDisplayName: info.appDisplayName || null, appBundleIdentifier: info.appBundleIdentifier || null,
+  };
+}
+
+function jsonError(error: unknown): Record<string, unknown> {
+  const message = error instanceof Error ? error.message : String(error);
+  const protocol = error && typeof error === 'object' && 'code' in error ? error.code : undefined;
+  let code = 'operation_failed';
+  if (/Usage:|Unknown command|Invalid |must be |nonblank|unsupported/i.test(message)) code = 'invalid_arguments';
+  else if (/credentials|paired device|companion credentials/i.test(message)) code = 'credentials_unavailable';
+  else if (/not focused/i.test(message)) code = 'text_unfocused';
+  return { code, message, ...(typeof protocol === 'number' ? { protocolCode: protocol } : {}) };
+}
+
+async function cmdJsonWatch(deviceId: string | undefined, writer: JsonLineWriter): Promise<void> {
+  const { id, credentials } = loadCredentials(deviceId);
+  await connectCached(id, 'mrp', async (device) => {
+    const atv = new AppleTV(device);
+    let terminal = false;
+    const emit = (name: string, data: Record<string, unknown>, key?: string) =>
+      writer.write(jsonRecord('event', name, data, id), key);
+    const finish = async (name: string, data: Record<string, unknown>, exitCode = 0) => {
+      if (terminal) return;
+      terminal = true;
+      emit(name, data);
+      await atv.close();
+      process.exitCode = exitCode;
+    };
+    const onSignal = () => { void finish('watch-close', { reason: 'signal' }, 130); };
+    process.once('SIGINT', onSignal);
+    process.once('SIGTERM', onSignal);
+    atv.on('nowPlaying', (info) => emit('playback', playbackData(info), 'playback'));
+    atv.on('volume', (volume) => emit('volume', { value: volume }, 'volume'));
+    atv.on('outputDevices', (outputs: { identifier: string; name: string }[]) => emit('output-devices', { devices: outputs.map((d) => ({ id: d.identifier, name: d.name })) }, 'outputs'));
+    atv.on('keyboard', (info: KeyboardInfo) => emit('text-focus', { state: info.focused ? 'focused' : 'unfocused', title: info.title ?? null, prompt: info.prompt ?? null }, 'focus'));
+    atv.on('close', () => { if (!terminal) void finish('connection-close', { intentional: false, transport: 'mrp' }, 1); });
+    atv.on('error', (error: Error) => emit('connection-error', jsonError(error)));
+    try {
+      await atv.connect(credentials, { settleMs: settleMs() });
+      emit('connection', { transport: 'mrp', state: 'connected' });
+      emit('playback', playbackData(atv.nowPlaying), 'playback');
+      emit('volume', { value: atv.volume ?? null, state: atv.volume === undefined ? 'unknown' : 'known' }, 'volume');
+      emit('output-devices', { devices: atv.outputDevices.map((d) => ({ id: d.identifier, name: d.name })) }, 'outputs');
+      if (credentials.companionCredentials && device.companionPort) {
+        atv.on('powerState', (state) => emit('power', { state }, 'power'));
+        atv.on('textFocusState', (state) => emit('text-focus', { state }, 'focus'));
+        atv.on('companionClose', () => { if (!terminal) void finish('connection-close', { intentional: false, transport: 'companion' }, 1); });
+        await atv.connectCompanion(credentials.companionCredentials);
+        emit('connection', { transport: 'companion', state: 'connected' });
+      } else {
+        emit('source', { source: 'companion', state: 'unavailable' });
+      }
+      await new Promise<void>((resolve) => {
+        const done = () => resolve();
+        atv.once('close', done);
+        atv.once('companionClose', done);
+      });
+    } finally {
+      process.removeListener('SIGINT', onSignal);
+      process.removeListener('SIGTERM', onSignal);
+      await atv.close();
+    }
+  });
+}
+
+async function mainJson(argv: string[]): Promise<void> {
+  const [command, ...args] = argv;
+  const writer = new JsonLineWriter();
+  if (!command || ['help', '--help', '-h'].includes(command)) {
+    writer.write(jsonRecord('result', 'help', { schemaVersion: JSON_VERSION }));
+    await writer.finish();
+    return;
+  }
+  if (['pair', 'companion-pair', 'dmap-pair', 'dmap', 'remote', 'messages', 'keyboard', 'companion-test', 'raop-stream'].includes(command)) {
+    throw new Error(`Unsupported in JSON mode: ${command}`);
+  }
+  if (command === 'watch') {
+    argumentsFor(args, 0, 'watch [device]');
+    await cmdJsonWatch(args[0], writer);
+    await writer.finish();
+    return;
+  }
+  if (command === 'scan') {
+    argumentsFor(args, 0, 'scan');
+    const devices = await scan({ timeout: 5000 });
+    writer.write(jsonRecord('result', 'scan', { devices: devices.map((d) => ({
+      id: d.deviceId, name: d.name, address: d.address, port: d.port, model: d.model, psi: d.airplayPsi ?? null,
+    })) }));
+    await writer.finish();
+    return;
+  }
+  // Reuse the normal dispatcher operations, but route their concrete return values through the writer.
+  const result = await main(argv, true);
+  if (!result) throw new Error('JSON command produced no result');
+  writer.write(jsonRecord('result', command, result.data, result.deviceId));
+  await writer.finish();
+}
+
 /** Validate and dispatch CLI arguments. Errors propagate to the executable's exit handler. */
-export async function main(argv: string[]): Promise<void> {
+export async function main(argv: string[], jsonInternal = false): Promise<{ data: Record<string, unknown>; deviceId?: string } | void> {
+  if (!jsonInternal) {
+    const jsonIndexes = argv.reduce<number[]>((indexes, value, index) => value === '--json' ? [...indexes, index] : indexes, []);
+    if (jsonIndexes.length > 1) throw new Error('Invalid arguments: --json may be specified once');
+    if (jsonIndexes.length === 1) {
+      const jsonArgv = argv.filter((_, index) => index !== jsonIndexes[0]);
+      try {
+        await mainJson(jsonArgv);
+      } catch (error) {
+        const writer = new JsonLineWriter();
+        writer.write(jsonRecord('error', jsonArgv[0] ?? 'unknown', jsonError(error)));
+        await writer.finish();
+        process.exitCode = 1;
+      }
+      return;
+    }
+  }
   const [cmd, ...args] = argv;
   if (!cmd || ['help', '--help', '-h'].includes(cmd)) { help(); return; }
   let companion = false;
@@ -637,7 +824,8 @@ export async function main(argv: string[]): Promise<void> {
     case 'command': case 'cmd': {
       const { action, rest } = splitAction(args, 1);
       argumentsFor(rest, 1, 'command <key> [action] [device]');
-      return cmdCommand(rest[0], action, rest[1]);
+      const result = await cmdCommand(rest[0], action, rest[1], jsonInternal);
+      return jsonInternal ? { data: result ?? { acknowledged: false }, deviceId: rest[1] } : undefined;
     }
     case 'click': {
       const { action, rest } = splitAction(args, 0);
@@ -747,13 +935,21 @@ export async function main(argv: string[]): Promise<void> {
     }
     case 'scan': case 'pair': case 'companion-pair':
       if (args.length) throw new Error(`Usage: atv ${cmd}`);
+      if (jsonInternal) throw new Error(`Unsupported in JSON mode: ${cmd}`);
       return cmd === 'scan' ? cmdScan() : cmd === 'pair' ? cmdPair() : cmdCompanionPair();
     case 'remote': case 'state': case 'queue': case 'messages': case 'keyboard': case 'companion-test':
       argumentsFor(args, 0, `${cmd} [device]`);
+      if (cmd === 'state') {
+        const result = await cmdState(args[0], jsonInternal);
+        return jsonInternal ? { data: result ?? {}, deviceId: args[0] } : undefined;
+      }
+      if (cmd === 'queue') {
+        const result = await cmdQueue(args[0], jsonInternal);
+        return jsonInternal ? { data: result ?? {}, deviceId: args[0] } : undefined;
+      }
+      if (jsonInternal) throw new Error(`Unsupported in JSON mode: ${cmd}`);
       switch (cmd) {
         case 'remote': return cmdRemote(args[0]);
-        case 'state': return cmdState(args[0]);
-        case 'queue': return cmdQueue(args[0]);
         case 'messages': return cmdMessages(args[0]);
         case 'keyboard': return cmdKeyboard(args[0]);
         case 'companion-test': return cmdCompanionTest(args[0]);
@@ -761,17 +957,26 @@ export async function main(argv: string[]): Promise<void> {
       return;
     case 'artwork':
       if (args.length > 2) throw new Error('Usage: atv artwork [device] [output.jpg]');
-      return cmdArtwork(args[0], args[1]);
+      {
+        const result = await cmdArtwork(args[0], args[1], jsonInternal);
+        return jsonInternal ? { data: result ?? {}, deviceId: args[0] } : undefined;
+      }
     default: throw new Error(`Unknown command: ${cmd}. Run "atv --help".`);
   }
   const atv = await (companion ? connectToCompanion(device) : connectToDevice(device));
   try {
     const result = await operation(atv);
+    // Give unacknowledged sends time to reach the TV before close() destroys the socket.
+    if (!acknowledged) await delay(postSendMs());
+    if (jsonInternal) {
+      const data = Array.isArray(result)
+        ? { items: result.map((item) => 'bundleId' in item ? { id: item.bundleId, name: item.name } : { id: item.id, name: item.name }) }
+        : result === undefined ? { acknowledged } : { value: result, acknowledged };
+      return { data, deviceId: device };
+    }
     if (Array.isArray(result)) {
       for (const item of result) console.log(`${'bundleId' in item ? item.bundleId : item.id}\t${item.name}`);
     } else if (result !== undefined) console.log(result);
-    // Give unacknowledged sends time to reach the TV before close() destroys the socket.
-    if (!acknowledged) await delay(postSendMs());
   } finally {
     await atv.close();
   }

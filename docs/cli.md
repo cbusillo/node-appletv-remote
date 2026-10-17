@@ -49,6 +49,23 @@ atv dmap state [deviceId]         # title, artist, album, play state
 # Legacy RAOP audio (experimental; see audio-and-playback.md)
 atv raop-stream 192.168.1.20 track.pcm  # raw PCM16LE stereo 44.1 kHz, no WAV header
 ```
+## JSON Lines mode
+
+Prefix a supported command with `--json` to receive only UTF-8 JSON Lines on stdout. Diagnostics remain on stderr. Every line is one object with `version: 1`, `type` (`result`, `event`, or `error`), `command`, ISO-8601 `timestamp`, optional selected `deviceId`, and a typed `data` object:
+
+```bash
+atv --json scan
+# {"version":1,"type":"result","command":"scan","timestamp":"...","data":{"devices":[]}}
+atv --json state living-room
+# {"version":1,"type":"result","command":"state","timestamp":"...","deviceId":"living-room","data":{"hasPlayback":false,"playbackState":"unknown","title":null,...}}
+```
+
+One-shot operations emit exactly one `result` or `error`; successful actions contain `data.acknowledged`. `false` means the protocol write has completed but the TV does not provide a visible execution acknowledgement. Lists are arrays (`devices` or `items`), and artwork is written to the requested path with `path`, `bytes`, and `available` in its result. Empty strings and unavailable numeric metadata are represented as `null`; enum values are stable lowercase strings, with `unknown` whenever the device has not supplied a value.
+
+`atv --json watch [device]` emits normalized `connection`, `playback`, `volume`, `output-devices`, `text-focus`, and (when Companion is available) `power` events. Initial values are snapshots and explicitly use `unknown` or `null` when unavailable; Companion absence emits a `source` event rather than invented state. A connection loss emits one `connection-close` event with `intentional: false` and exits nonzero. SIGINT/SIGTERM emits `watch-close` with `reason: "signal"`, closes owned transports, and exits 130. There is no automatic reconnect. State events may coalesce if stdout is slow; terminal records are never coalesced. A broken stdout pipe stops output and tears down the watch.
+
+Interactive pairing/prompts, raw diagnostic streams (`messages`, `keyboard`, and `companion-test`), DMAP, and RAOP streaming are rejected in JSON mode before network I/O. JSON error data contains a stable `code` and safe `message`; protocol numeric codes are retained when present, but stacks, credentials, raw payloads, and private keys are never emitted.
+
 
 Credentials are saved to `~/.atv-credentials.json`. Leave out `deviceId` to use the most recently paired device. An explicit selector matches a paired device ID case-insensitively; blank or unmatched selectors fail instead of silently selecting the last device. Each device's last working address is cached in `~/.atv-devices.json`, so commands skip the network scan. If the TV has moved, the CLI rescans automatically; an address that silently drops packets fails over after a 5 s connect timeout rather than the OS TCP timeout (about 75 s on macOS).
 
