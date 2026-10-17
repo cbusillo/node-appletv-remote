@@ -126,6 +126,8 @@ export class DiscoveredDevice {
 export interface ScanOptions {
   /** How long to browse, in ms; default 5000. */
   timeout?: number;
+  /** Cancel browsing and release every browser/socket before rejecting. */
+  signal?: AbortSignal;
   /** Keep only devices for which this returns true. */
   filter?: (device: DiscoveredDevice) => boolean;
   /**
@@ -155,6 +157,7 @@ function usableAddresses(service: Service): string[] {
 
 /** Browse unauthenticated services; ambiguous associations stay separate. Callback errors stop all browsers. */
 export async function scan(options: ScanOptions = {}): Promise<DiscoveredDevice[]> {
+  options.signal?.throwIfAborted();
   type RecordEntry = {
     type: string; service: Service; addresses: string[]; txt: Record<string, string>;
     ids: string[]; identity: { mac?: string; mrp?: string; dmap?: string };
@@ -233,6 +236,7 @@ export async function scan(options: ScanOptions = {}): Promise<DiscoveredDevice[
     const cleanup = (): void => {
       done = true;
       clearTimeout(timer);
+      options.signal?.removeEventListener('abort', abort);
       for (const browser of browsers) browser.stop();
       instance.destroy();
     };
@@ -244,6 +248,9 @@ export async function scan(options: ScanOptions = {}): Promise<DiscoveredDevice[
         cleanup(); resolve(result);
       } catch (error) { fail(error); }
     };
+    const abort = () => fail(options.signal?.reason ?? new Error('Discovery cancelled'));
+    options.signal?.addEventListener('abort', abort, { once: true });
+    if (options.signal?.aborted) { abort(); return; }
     for (const type of ['airplay', 'raop', 'companion-link', 'mediaremotetv', 'touch-able', 'appletv-v2']) {
       browsers.push(instance.find({ type, protocol: 'tcp' }, (service: Service) => {
         if (done) return;
