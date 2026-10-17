@@ -705,7 +705,8 @@ function jsonError(error: unknown): Record<string, unknown> {
   const message = error instanceof Error ? error.message : String(error);
   const protocol = error && typeof error === 'object' && 'code' in error ? error.code : undefined;
   let code = 'operation_failed';
-  if (/Usage:|Unknown command|Invalid |must be |nonblank|unsupported/i.test(message)) code = 'invalid_arguments';
+  if (/Unsupported in JSON mode/i.test(message)) code = 'unsupported';
+  else if (/Usage:|Unknown command|Invalid |must be |nonblank|unsupported/i.test(message)) code = 'invalid_arguments';
   else if (/credentials|paired device|companion credentials/i.test(message)) code = 'credentials_unavailable';
   else if (/not focused/i.test(message)) code = 'text_unfocused';
   return { code, message, ...(typeof protocol === 'number' ? { protocolCode: protocol } : {}) };
