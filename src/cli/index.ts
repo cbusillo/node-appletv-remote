@@ -312,7 +312,15 @@ async function cmdQueue(deviceId?: string, json = false): Promise<Record<string,
     console.error('Requesting playback queue...');
     const response = await atv.requestPlaybackQueue({ location: 0, length: 20, includeMetadata: true });
     const items = contentItems(response);
-    if (json) return { items };
+    if (json) return { items: items.map((item) => {
+      const metadata = item.metadata as Record<string, unknown> | undefined;
+      return {
+        id: typeof item.identifier === 'string' ? item.identifier : null,
+        title: typeof metadata?.title === 'string' ? metadata.title : null,
+        artist: typeof metadata?.artist === 'string' ? metadata.artist : null,
+        album: typeof metadata?.album === 'string' ? metadata.album : null,
+      };
+    }) };
     if (items.length > 0) {
       items.forEach((item, i) => {
         const metadata = item.metadata as Record<string, unknown> | undefined;
@@ -706,20 +714,21 @@ function playbackData(info: NowPlayingInfo): Record<string, unknown> {
   return {
     hasPlayback: info.hasPlayback, playerIdentifier: info.playerIdentifier || null,
     title: info.title || null, artist: info.artist || null, album: info.album || null,
-    genre: info.genre || null, duration: info.duration || null, elapsedTime: info.elapsedTime || null,
-    playbackRate: info.playbackRate || null, playbackState: states[info.playbackState] ?? 'unknown',
+    genre: info.genre || null, duration: info.duration, elapsedTime: info.elapsedTime,
+    playbackRate: info.playbackRate, playbackState: states[info.playbackState] ?? 'unknown',
     appDisplayName: info.appDisplayName || null, appBundleIdentifier: info.appBundleIdentifier || null,
   };
 }
 
 function jsonError(error: unknown): Record<string, unknown> {
   const message = error instanceof Error ? error.message : String(error);
-  const protocol = error && typeof error === 'object' && 'code' in error ? error.code : undefined;
+  const protocol = error && typeof error === 'object' && 'errorCode' in error
+    ? error.errorCode : error && typeof error === 'object' && 'code' in error ? error.code : undefined;
   let code = 'operation_failed';
   if (/Unsupported in JSON mode/i.test(message)) code = 'unsupported';
   else if (/Usage:|Unknown command|Invalid |must be |nonblank|unsupported/i.test(message)) code = 'invalid_arguments';
   else if (/credentials|paired device|companion credentials/i.test(message)) code = 'credentials_unavailable';
-  else if (/not focused/i.test(message)) code = 'text_unfocused';
+  else if (/No text field is focused|not focused/i.test(message)) code = 'text_unfocused';
   return { code, message, ...(typeof protocol === 'number' ? { protocolCode: protocol } : {}) };
 }
 
@@ -811,7 +820,15 @@ async function mainJson(argv: string[]): Promise<void> {
 export async function main(argv: string[], jsonInternal = false): Promise<{ data: Record<string, unknown>; deviceId?: string } | void> {
   if (!jsonInternal) {
     const jsonIndexes = argv.reduce<number[]>((indexes, value, index) => value === '--json' ? [...indexes, index] : indexes, []);
-    if (jsonIndexes.length > 1) throw new Error('Invalid arguments: --json may be specified once');
+    if (jsonIndexes.length > 1) {
+      const writer = new JsonLineWriter();
+      writer.write(jsonRecord('error', argv.find((value) => value !== '--json') ?? 'unknown', {
+        code: 'invalid_arguments', message: '--json may be specified once',
+      }));
+      await writer.finish();
+      process.exitCode = 1;
+      return;
+    }
     if (jsonIndexes.length === 1) {
       const jsonArgv = argv.filter((_, index) => index !== jsonIndexes[0]);
       try {
@@ -893,13 +910,15 @@ export async function main(argv: string[], jsonInternal = false): Promise<{ data
       return cmdRaopStream(args[0], args[1]);
     case 'stop': case 'power':
       argumentsFor(args, 0, `${cmd} [device]`);
-      device = args[0]; companion = acknowledged = cmd === 'power';
+      device = args[0]; companion = cmd === 'power';
+      acknowledged = true;
       operation = cmd === 'stop' ? (atv) => atv.stop() : (atv) => atv.fetchPowerState();
       break;
     case 'seek': case 'skip-forward': case 'skip-backward': case 'volume': {
       argumentsFor(args, 1, `${cmd} <number> [device]`);
       const value = numberArgument(args[0], 0, cmd === 'volume' ? 100 : Infinity, cmd.startsWith('skip-'));
       device = args[1];
+      acknowledged = cmd !== 'volume';
       operation = (atv) => cmd === 'seek' ? atv.setPosition(value) : cmd === 'volume' ? atv.setVolume(value) :
         cmd === 'skip-forward' ? atv.skipForward(value) : atv.skipBackward(value);
       break;
@@ -910,6 +929,7 @@ export async function main(argv: string[], jsonInternal = false): Promise<{ data
       const repeat: Record<string, RepeatState> = { off: RepeatState.Off, track: RepeatState.Track, all: RepeatState.All };
       if (!Object.hasOwn(cmd === 'shuffle' ? shuffle : repeat, args[0])) throw new Error(`Invalid ${cmd} mode: ${args[0]}`);
       device = args[1];
+      acknowledged = true;
       operation = (atv) => cmd === 'shuffle' ? atv.setShuffle(shuffle[args[0]]) : atv.setRepeat(repeat[args[0]]);
       break;
     }
@@ -982,7 +1002,7 @@ export async function main(argv: string[], jsonInternal = false): Promise<{ data
     if (!acknowledged) await delay(postSendMs());
     if (jsonInternal) {
       const data = Array.isArray(result)
-        ? { items: result.map((item) => 'bundleId' in item ? { id: item.bundleId, name: item.name } : { id: item.id, name: item.name }) }
+        ? { items: result.map((item) => 'bundleId' in item ? { id: item.bundleId, name: item.name } : { id: item.id, name: item.name }), acknowledged }
         : result === undefined ? { acknowledged } : { value: result, acknowledged };
       return { data, deviceId: device };
     }
