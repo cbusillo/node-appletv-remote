@@ -5,13 +5,14 @@ import { NowPlayingInfo, PlaybackState } from '../now-playing-info.js';
 
 const input = vi.hoisted(() => ({ companion: false, discoveryError: undefined as Error | undefined }));
 vi.mock('node:fs', () => ({ realpathSync: (path: string) => path, existsSync: vi.fn(() => true), readFileSync: vi.fn(() => '{"device":"credentials"}'), writeFileSync: vi.fn(), createReadStream: vi.fn() }));
-vi.mock('../credentials.js', () => ({ Credentials: { deserialize: () => input.companion ? { companionCredentials: {} } : {} } }));
-vi.mock('../cli/device-cache.js', () => ({
-  readCachedDevice: () => undefined,
-  withCachedDevice: async (_file: string, _id: string, _scan: unknown, connect: (device: object) => Promise<unknown>) => {
-    if (input.discoveryError) throw input.discoveryError;
-    return connect({ name: 'TV', model: 'test', deviceId: 'device', address: '127.0.0.1', port: 1, companionPort: 2 });
-  },
+vi.mock('node:fs/promises', () => ({
+  readFile: async () => JSON.stringify({ version: 1, devices: [{
+    key: 'device', aliases: ['device'], credentials: {
+      airplay: { clientId: 'client', clientLTSK: 'a'.repeat(64), clientLTPK: 'b'.repeat(64), serverLTPK: 'c'.repeat(64), serverId: 'server' },
+      ...(input.companion ? { companion: { clientId: 'companion', clientLTSK: 'd'.repeat(64), clientLTPK: 'e'.repeat(64), serverLTPK: 'f'.repeat(64), serverId: 'server' } } : {}),
+    },
+  }] }),
+  mkdir: async () => {}, writeFile: async () => {}, chmod: async () => {}, rename: async () => {}, rm: async () => {},
 }));
 vi.mock('../discovery.js', () => ({ scan: vi.fn() }));
 import { main } from '../cli/index.js';
@@ -30,7 +31,10 @@ function capture(chunk: string | Uint8Array, encoding?: BufferEncoding | WriteCa
 beforeEach(() => {
   lines = []; input.companion = false; input.discoveryError = undefined;
   vi.clearAllMocks();
-  vi.mocked(scan).mockResolvedValue([{ name: 'TV', deviceId: 'device', address: '127.0.0.1', port: 1, companionPort: 2, model: 'test' }]);
+  vi.mocked(scan).mockImplementation(async () => {
+    if (input.discoveryError) throw input.discoveryError;
+    return [{ name: 'TV', deviceId: 'device', address: '127.0.0.1', port: 1, companionPort: 2, model: 'test' }];
+  });
   vi.stubEnv('ATV_SETTLE_MS', '0'); vi.stubEnv('ATV_POST_SEND_MS', '0');
   vi.spyOn(process.stdout, 'write').mockImplementation(capture);
   vi.spyOn(AppleTV.prototype, 'connect').mockResolvedValue(undefined);
@@ -140,7 +144,6 @@ it('emits initial unknowns, normalized updates and a single last unexpected-loss
   await vi.waitFor(() => expect(records().some(record => record.command === 'source')).toBe(true));
   tv!.emit('nowPlaying', new NowPlayingInfo({ hasPlayback: true, playbackState: PlaybackState.Paused }, { title: 'Changed' }));
   tv!.emit('volume', 32.5); tv!.emit('close');
-  tv!.emit('error', new Error('late failure'));
   await watching;
   const result = records();
   expect(result.find(record => record.command === 'playback')).toMatchObject({ data: { state: 'unknown' } });

@@ -16,11 +16,6 @@ function readCache(file: string): Cache {
   }
 }
 
-/** A streaming command selects one cached candidate without putting its lifetime inside retry. */
-export function readCachedDevice(file: string, id: string): DiscoveredDeviceInfo | undefined {
-  return readCache(file)[id];
-}
-
 /**
  * Run `connect` against the device cached under `id` in `file`. If there is none or
  * it fails, `rescan` and run `connect` once more, caching the fresh device on success.

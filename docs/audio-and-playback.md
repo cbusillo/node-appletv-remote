@@ -19,11 +19,29 @@ try {
 
 This is actual authenticated media playback, not `launchApp(url)`. The receiver must be able to fetch the HTTP(S) URL directly; web pages and app deep links are not media URLs. AirPlay HAP credentials are supplied by the caller; this API does not read credential files or pair automatically. Each session starts one URL and cannot be reused after closing. `playUrl` resolves when the receiver accepts the setup/play/rate requests, not when playback completes. `idle` means the receiver reports no duration and can also mean startup buffering, so it is not proof that playback ended.
 
+### Local files
+
+`playFile(path, position?, { address? })` opens one existing regular file and exposes it at one cryptographically random, temporary HTTP path before queuing it with the existing URL playback flow:
+
+```typescript
+const playback = new AirPlayPlaybackSession(device.address, device.port, credentials);
+try {
+  await playback.playFile('/media/movie.mp4', 12.5, { address: '192.168.1.20' });
+  // Keep the session open while the receiver may fetch or seek the file.
+} finally {
+  playback.close();
+}
+```
+
+The listener is bound to the supplied concrete local IPv4/IPv6 address, or by default the address selected by the OS route to the receiver. It never binds all interfaces by default. The receiver must be able to reach that LAN address. The random URL is a LAN bearer capability: do not log or share it. It serves only that opened file (not its directory) with GET/HEAD and one byte range; it does not transcode, add TLS/authentication, or make unsupported codecs playable.
+
+The listener remains available while the receiver reports `loading`/`idle`, because that can be startup or re-fetching rather than completion. It is shut down on `close()`, playback/setup failure, listener/read errors, or a receiver-confirmed `stopped` state. If the receiver never confirms completion, the caller owns the session and must call `close()`.
+
 Timing replies are restricted to the connected TCP peer address and, when returned by SETUP, its timing port. Only 32-byte RTP timing requests (payload type `0x52`, or `0xd2` with the marker bit) are answered, whatever their first (version) byte; the reply echoes that byte. Other 32-byte packets get no reply. UDP timing-reply send errors are ignored; timing socket failures still close the session.
 
 HTTP errors, connection loss, malformed status, and `/playback-info` media errors reject and close the failed session. Background heartbeat failures close the session and surface on the next `getStatus`. Requests have a five-second timeout (including URL acceptance); receivers taking longer to probe media will fail. Replies are limited to 1 MiB; duplicate Content-Length framing headers and all Transfer-Encoding responses are rejected. Binary and XML playback-info property lists are supported. A rejected `/play` is surfaced immediately; the authenticated SETUP sequence is not retried.
 
-The implementation uses same-socket HAP verification, NTP/event SETUP, feedback, RECORD, binary-plist `/play`, rate/property requests, and `/playback-info`. Stop closes the dedicated connection; it does not send a teardown command. Tests use a synthetic loopback receiver and generated keys. **Media/codec compatibility and URL playback on physical hardware remain unverified.** IPv6 receivers are supported: the timing socket binds the matching family and the Host header and RTSP URI bracket the literal. Legacy AirPlay 1, mirroring, DRM, local-file hosting, and transcoding are not supported.
+The implementation uses same-socket HAP verification, NTP/event SETUP, feedback, RECORD, binary-plist `/play`, rate/property requests, and `/playback-info`. Stop closes the dedicated connection; it does not send a teardown command. Tests use a synthetic loopback receiver and generated keys. **Media/codec compatibility and URL playback on physical hardware remain unverified.** IPv6 receivers are supported: the timing socket binds the matching family and the Host header and RTSP URI bracket the literal. Legacy AirPlay 1, mirroring, DRM, and transcoding are not supported.
 
 ## RAOP and AirPlay 2 audio (experimental, partial #22)
 
@@ -36,9 +54,10 @@ Hardware status: AirPlay 2 realtime audio, RAOP discovery and `wavPcm` are verif
 [tested models](https://github.com/energee/node-appletv-remote/blob/main/README.md#tested-on); legacy receivers
 and legacy PIN pairing are verified only against loopback tests. HomePods and other receivers needing transient pairing,
 AirPlay 2 buffered audio, RSA/FairPlay/MFi authentication, password digest auth,
-ALAC, transcoding, multiroom, live sources, artwork,
+ALAC, multiroom, live sources, artwork,
 and progress are excluded. `atv raop-stream` wraps this API
-for PIN-less legacy receivers (it supplies neither a `legacySeed` nor HAP credentials).
+for PIN-less legacy receivers (it supplies neither a `legacySeed` nor HAP credentials). Its CLI adapter can
+use an installed `ffmpeg` to decode finite files and HTTP(S) URLs; transcoding is not part of `RaopStream`.
 
 `scan()` browses `_raop._tcp` and fills `raopAddress`, `raopPort` and `raopTxt` (see
 [Discovery](internals.md#discovery-and-transport-selection)). End to end, discovering a receiver and
@@ -171,7 +190,8 @@ chunk before `fmt `, or a file that ends before the declared data length throws 
 `Invalid WAV` error. Other chunks (such as `LIST`) are skipped, honoring odd-size pad
 bytes, and nothing after `data` is read. The Readable is destroyed when iteration
 ends. Other formats need converting first (for example with ffmpeg); this library
-does not transcode.
+does not transcode. The `atv raop-stream` CLI performs that conversion for finite local files,
+incompatible WAV files, and HTTP(S) URLs when `ffmpeg` is installed; see [the CLI reference](cli.md).
 
 ```typescript
 import { createReadStream } from 'node:fs';
