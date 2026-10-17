@@ -734,53 +734,60 @@ function jsonError(error: unknown): Record<string, unknown> {
 
 async function cmdJsonWatch(deviceId: string | undefined, writer: JsonLineWriter): Promise<void> {
   const { id, credentials } = loadCredentials(deviceId);
-  await connectCached(id, 'mrp', async (device) => {
-    const atv = new AppleTV(device);
-    let terminal = false;
-    const emit = (name: string, data: Record<string, unknown>, key?: string) =>
-      writer.write(jsonRecord('event', name, data, id), key);
-    const finish = async (name: string, data: Record<string, unknown>, exitCode = 0) => {
-      if (terminal) return;
-      terminal = true;
-      emit(name, data);
-      await atv.close();
-      process.exitCode = exitCode;
-    };
-    const onSignal = () => { void finish('watch-close', { reason: 'signal' }, 130); };
-    process.once('SIGINT', onSignal);
-    process.once('SIGTERM', onSignal);
-    atv.on('nowPlaying', (info) => emit('playback', playbackData(info), 'playback'));
-    atv.on('volume', (volume) => emit('volume', { value: volume }, 'volume'));
-    atv.on('outputDevices', (outputs: { identifier: string; name: string }[]) => emit('output-devices', { devices: outputs.map((d) => ({ id: d.identifier, name: d.name })) }, 'outputs'));
-    atv.on('keyboard', (info: KeyboardInfo) => emit('text-focus', { state: info.focused ? 'focused' : 'unfocused', title: info.title ?? null, prompt: info.prompt ?? null }, 'focus'));
-    atv.on('close', () => { if (!terminal) void finish('connection-close', { intentional: false, transport: 'mrp' }, 1); });
-    atv.on('error', (error: Error) => emit('connection-error', jsonError(error)));
-    try {
-      await atv.connect(credentials, { settleMs: settleMs() });
-      emit('connection', { transport: 'mrp', state: 'connected' });
-      emit('playback', playbackData(atv.nowPlaying), 'playback');
-      emit('volume', { value: atv.volume ?? null, state: atv.volume === undefined ? 'unknown' : 'known' }, 'volume');
-      emit('output-devices', { devices: atv.outputDevices.map((d) => ({ id: d.identifier, name: d.name })) }, 'outputs');
-      if (credentials.companionCredentials && device.companionPort) {
-        atv.on('powerState', (state) => emit('power', { state }, 'power'));
-        atv.on('textFocusState', (state) => emit('text-focus', { state }, 'focus'));
-        atv.on('companionClose', () => { if (!terminal) void finish('connection-close', { intentional: false, transport: 'companion' }, 1); });
-        await atv.connectCompanion(credentials.companionCredentials);
-        emit('connection', { transport: 'companion', state: 'connected' });
-      } else {
-        emit('source', { source: 'companion', state: 'unavailable' });
-      }
-      await new Promise<void>((resolve) => {
-        const done = () => resolve();
-        atv.once('close', done);
-        atv.once('companionClose', done);
-      });
-    } finally {
-      process.removeListener('SIGINT', onSignal);
-      process.removeListener('SIGTERM', onSignal);
-      await atv.close();
-    }
-  });
+  // A watch is one session: discovery is intentionally not retried after it begins emitting.
+  const device = await findDevice(id, 'mrp');
+  const atv = new AppleTV(device);
+  let terminal = false;
+  let observedPlayback = false;
+  let complete: (() => void) | undefined;
+  const emit = (name: string, data: Record<string, unknown>, key?: string) => {
+    if (!terminal) writer.write(jsonRecord('event', name, data, id), key);
+  };
+  const finish = async (name: string, data: Record<string, unknown>, exitCode = 0) => {
+    if (terminal) return;
+    terminal = true;
+    writer.write(jsonRecord('event', name, data, id));
+    complete?.();
+    await atv.close();
+    process.exitCode = exitCode;
+  };
+  const onSignal = () => { void finish('watch-close', { reason: 'signal' }, 130); };
+  process.once('SIGINT', onSignal);
+  process.once('SIGTERM', onSignal);
+  atv.on('nowPlaying', (info) => { observedPlayback = true; emit('playback', playbackData(info), 'playback'); });
+  atv.on('volume', (volume) => emit('volume', { value: volume }, 'volume'));
+  atv.on('outputDevices', (outputs: { identifier: string; name: string }[]) => emit('output-devices', { devices: outputs.map((d) => ({ id: d.identifier, name: d.name })) }, 'outputs'));
+  atv.on('keyboard', (info: KeyboardInfo) => emit('text-focus', { state: info.focused ? 'focused' : 'unfocused', title: info.title ?? null, prompt: info.prompt ?? null }, 'focus'));
+  atv.on('close', () => { if (!terminal) void finish('connection-close', { intentional: false, transport: 'mrp' }, 1); });
+  atv.on('error', (error: Error) => { if (!terminal) emit('connection-error', jsonError(error)); });
+  try {
+    await atv.connect(credentials, { settleMs: settleMs() });
+    emit('connection', { transport: 'mrp', state: 'connected' });
+    if (observedPlayback) emit('playback', playbackData(atv.nowPlaying), 'playback');
+    else emit('playback', { state: 'unknown' }, 'playback');
+    emit('volume', { value: atv.volume ?? null, state: atv.volume === undefined ? 'unknown' : 'known' }, 'volume');
+    emit('output-devices', { devices: atv.outputDevices.map((d) => ({ id: d.identifier, name: d.name })) }, 'outputs');
+    if (credentials.companionCredentials && device.companionPort) {
+      atv.on('powerState', (state) => emit('power', { state }, 'power'));
+      atv.on('textFocusState', (state) => emit('text-focus', { state }, 'focus'));
+      atv.on('companionError', (error: Error) => { if (!terminal) emit('connection-error', jsonError(error)); });
+      atv.on('companionClose', () => { if (!terminal) void finish('connection-close', { intentional: false, transport: 'companion' }, 1); });
+      await atv.connectCompanion(credentials.companionCredentials);
+      atv.subscribePowerState();
+      emit('connection', { transport: 'companion', state: 'connected' });
+      emit('power', { state: atv.powerState }, 'power');
+      emit('text-focus', { state: atv.textFocusState }, 'focus');
+    } else emit('source', { source: 'companion', state: 'unavailable' });
+    await new Promise<void>((resolve) => { complete = resolve; });
+  } catch (error) {
+    // The outer JSON command writer owns the single setup failure record.
+    terminal = true;
+    throw error;
+  } finally {
+    process.removeListener('SIGINT', onSignal);
+    process.removeListener('SIGTERM', onSignal);
+    await atv.close();
+  }
 }
 
 async function mainJson(argv: string[]): Promise<void> {

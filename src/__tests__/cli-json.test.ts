@@ -14,6 +14,7 @@ let lines: string[];
 beforeEach(() => {
   lines = [];
   vi.clearAllMocks();
+  vi.mocked(scan).mockResolvedValue([{ name: 'TV', deviceId: 'device', address: '127.0.0.1', port: 1, model: 'test' }] as never);
   vi.stubEnv('ATV_SETTLE_MS', '0');
   vi.stubEnv('ATV_POST_SEND_MS', '0');
   vi.spyOn(process.stdout, 'write').mockImplementation((chunk: string | Uint8Array) => { lines.push(String(chunk)); return true; });
@@ -24,7 +25,6 @@ beforeEach(() => {
 afterEach(() => { vi.restoreAllMocks(); vi.unstubAllEnvs(); process.exitCode = undefined; });
 
 function record(): Record<string, unknown> { return JSON.parse(lines.join('')); }
-
 it('writes a typed empty scan result without human progress', async () => {
   vi.mocked(scan).mockResolvedValue([]);
   await main(['--json', 'scan']);
@@ -75,7 +75,7 @@ it('streams initial unknown snapshots, normalized changes, and one loss terminal
   expect(records.map((entry) => entry.command)).toEqual([
     'connection', 'playback', 'volume', 'output-devices', 'source', 'playback', 'volume', 'connection-close',
   ]);
-  expect(records[1]).toMatchObject({ type: 'event', data: { playbackState: 'unknown' } });
+  expect(records[1]).toMatchObject({ type: 'event', data: { state: 'unknown' } });
   expect(records[5]).toMatchObject({ type: 'event', data: { title: 'Changed', playbackState: 'paused' } });
   expect(records[7]).toMatchObject({ type: 'event', data: { intentional: false, transport: 'mrp' } });
   expect(process.exitCode).toBe(1);
