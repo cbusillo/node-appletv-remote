@@ -21,7 +21,7 @@ import { isIPv4 } from 'node:net';
 import { randomInt } from 'node:crypto';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { withCachedDevice } from './device-cache.js';
+import { withCachedDevice, readCachedDevice } from './device-cache.js';
 import { createInterface } from 'node:readline';
 import type { Message } from '../message.js';
 import type { KeyboardInfo, TextInputEvent, CompanionEvent, App, UserAccount, InputAction } from '../appletv.js';
@@ -33,6 +33,8 @@ const CREDS_FILE = join(process.env.HOME ?? '.', '.atv-credentials.json');
 const DMAP_FILE = join(process.env.HOME ?? '.', '.atv-dmap.json');
 /** Last-known address of each paired device, so commands can skip the mDNS scan. */
 const DEVICES_FILE = join(process.env.HOME ?? '.', '.atv-devices.json');
+const commandDeviceIds = new WeakMap<AppleTV, string>();
+const commandErrorDeviceIds = new WeakMap<object, string>();
 
 /** Non-negative ms from an env var, or `fallback` when unset/invalid; `0` disables the wait. */
 function envMs(name: string, fallback: number): number {
@@ -155,7 +157,7 @@ function loadCredentials(deviceId?: string): { id: string; credentials: Credenti
  * Scan (stopping early once found) and return the device whose ID equals or contains `id`, or whose name contains it (case-insensitive).
  * @throws if nothing matches; the message lists the devices that were found.
  */
-async function findDevice(id: string, need: 'mrp' | 'companion' | 'dmap'): Promise<DiscoveredDeviceInfo> {
+async function findDevice(id: string, need: 'mrp' | 'companion' | 'dmap' | 'any', signal?: AbortSignal): Promise<DiscoveredDeviceInfo> {
   console.error('Finding device...');
   const idLower = id.toLowerCase();
   const matches = (d: DiscoveredDeviceInfo) =>
@@ -165,8 +167,9 @@ async function findDevice(id: string, need: 'mrp' | 'companion' | 'dmap'): Promi
     d.deviceId.toLowerCase().includes(idLower);
   // Stop as soon as the device has arrived with the port `need` requires: Companion, DMAP, or an
   // AirPlay/usable MRP port.
-  const devices = await scan({ timeout: 5000, until: (d) => matches(d) && (need === 'companion' ? !!d.companionPort :
-    need === 'dmap' ? !!d.dmapPort : !!d.port || !!d.mrpPort && d.mrpEnabled !== false) });
+  const devices = await scan({ timeout: 5000, signal, until: (d) => matches(d) && (need === 'any'
+    ? !!d.port || !!d.companionPort || !!d.mrpPort && d.mrpEnabled !== false
+    : need === 'companion' ? !!d.companionPort : need === 'dmap' ? !!d.dmapPort : !!d.port || !!d.mrpPort && d.mrpEnabled !== false) });
   const device = devices.find(matches);
   if (!device) {
     throw new Error(`Device not found on network (looking for "${id}"). Found: ${devices.map((d) => `${d.name} [${d.deviceId}]`).join(', ')}`);
@@ -179,45 +182,62 @@ function connectCached<T>(
   id: string,
   need: 'mrp' | 'companion' | 'dmap',
   connect: (device: DiscoveredDeviceInfo) => Promise<T>,
+  signal?: AbortSignal,
 ): Promise<T> {
-  return withCachedDevice(DEVICES_FILE, id, () => findDevice(id, need), connect);
+  return withCachedDevice(DEVICES_FILE, id, () => {
+    signal?.throwIfAborted();
+    return findDevice(id, need, signal);
+  }, device => {
+    signal?.throwIfAborted();
+    return connect(device);
+  });
 }
 
 /** Load credentials, locate the device (cache first, then mDNS), and open an AirPlay/MRP connection. */
-async function connectToDevice(deviceId?: string): Promise<AppleTV> {
+async function connectToDevice(deviceId?: string, context?: JsonOperationContext): Promise<AppleTV> {
   const { id, credentials } = loadCredentials(deviceId);
+  context?.select(id);
   return connectCached(id, 'mrp', async (device) => {
     console.error(`Connecting to ${device.name} (${device.address}:${device.port})...`);
     const atv = new AppleTV(device);
+    commandDeviceIds.set(atv, id);
+    context?.register(atv);
+    context?.signal.throwIfAborted();
     atv.on('error', (err: Error) => console.error(`AirPlay error: ${err.message}`));
     try {
       await atv.connect(credentials, { settleMs: settleMs() });
     } catch (e) {
+      if (e && typeof e === 'object') commandErrorDeviceIds.set(e, id);
       await atv.close();
       throw e;
     }
     return atv;
-  });
+  }, context?.signal);
 }
 
 /** Load Companion credentials and connect only Companion, using the existing address cache. */
-async function connectToCompanion(deviceId?: string): Promise<AppleTV> {
+async function connectToCompanion(deviceId?: string, context?: JsonOperationContext): Promise<AppleTV> {
   const { id, credentials } = loadCredentials(deviceId);
+  context?.select(id);
   if (!credentials.companionCredentials) {
     throw new Error('No companion credentials. Run "atv companion-pair" first.');
   }
   return connectCached(id, 'companion', async (device) => {
     if (!device.companionPort) throw new Error('Device has no companion-link port');
     const atv = new AppleTV(device);
+    commandDeviceIds.set(atv, id);
+    context?.register(atv);
+    context?.signal.throwIfAborted();
     console.error(`Connecting companion to ${device.name} (${device.address}:${device.companionPort})...`);
     try {
       await atv.connectCompanion(credentials.companionCredentials!);
       return atv;
     } catch (error) {
+      if (error && typeof error === 'object') commandErrorDeviceIds.set(error, id);
       await atv.close();
       throw error;
     }
-  });
+  }, context?.signal);
 }
 
 /** Companion-only buttons exposed by `command`; no MRP connection is needed. */
@@ -231,19 +251,23 @@ const COMPANION_BUTTONS = {
  * sending fails. Only HID keys and Companion buttons accept an action; media keys, wake/suspend,
  * skips and `home_hold` are rejected before connecting.
  */
-async function cmdCommand(command: string, action?: InputAction, deviceId?: string, json = false): Promise<Record<string, unknown> | void> {
+async function cmdCommand(command: string, action?: InputAction, deviceId?: string, json = false, context?: JsonOperationContext): Promise<JsonCommandResult | void> {
   const button = Object.hasOwn(COMPANION_BUTTONS, command)
     ? COMPANION_BUTTONS[command as keyof typeof COMPANION_BUTTONS] : undefined;
   if (!button && !COMMAND_SET.has(command)) throw new Error(`Unknown command: ${command}. Run "atv --help".`);
   if (action && !button && !HID_KEY_MAP[command]) throw new Error(`Action modes are not supported for ${command}`);
-  const atv = await (button ? connectToCompanion(deviceId) : connectToDevice(deviceId));
+  const atv = await (button ? connectToCompanion(deviceId, context) : connectToDevice(deviceId, context));
   try {
+    context?.signal.throwIfAborted();
     if (button) await atv[button](action);
     else await atv.sendKeyCommand(command as Key, action);
     if (!json) console.log(`Sent: ${command}`);
-    await delay(postSendMs());
-    return json ? { acknowledged: false, command, action: action ?? 'singleTap' } : undefined;
-  } finally {
+    await delay(postSendMs(), undefined, { signal: context?.signal });
+    return json ? { deviceId: commandDeviceIds.get(atv) ?? atv.deviceId, data: {
+      acknowledged: button !== undefined || [Key.Play, Key.Pause, Key.Next, Key.Previous, Key.SkipForward, Key.SkipBackward].includes(command as Key),
+      command, action: action ?? 'singleTap',
+    } } : undefined;
+  } catch (error) { commandFailure(error, atv); } finally {
     await atv.close();
   }
 }
@@ -291,36 +315,38 @@ async function cmdRemote(deviceId?: string) {
 }
 
 /** `atv state [device]`: print title, artist, album, play state, progress, and app for the current item. */
-async function cmdState(deviceId?: string, json = false): Promise<Record<string, unknown> | void> {
-  const atv = await connectToDevice(deviceId);
+async function cmdState(deviceId?: string, json = false, context?: JsonOperationContext): Promise<JsonCommandResult | void> {
+  const atv = await connectToDevice(deviceId, context);
   try {
+    context?.signal.throwIfAborted();
     console.error('Requesting state...');
     const info = await atv.getNowPlaying();
-    if (json) return playbackData(info);
+    if (json) return { data: playbackData(info), deviceId: commandDeviceIds.get(atv) ?? atv.deviceId };
     const stopped = info.playbackState === PlaybackState.Stopped;
     const idle = !info.hasPlayback && (stopped || info.playbackState === PlaybackState.Unknown);
     console.log(idle ? `Nothing playing. [${stopped ? 'Stopped' : 'Absent'}]` : info.toString());
-  } finally {
+  } catch (error) { commandFailure(error, atv); } finally {
     await atv.close();
   }
 }
 
 /** `atv queue [device]`: print up to 20 items from the playback queue. */
-async function cmdQueue(deviceId?: string, json = false): Promise<Record<string, unknown> | void> {
-  const atv = await connectToDevice(deviceId);
+async function cmdQueue(deviceId?: string, json = false, context?: JsonOperationContext): Promise<JsonCommandResult | void> {
+  const atv = await connectToDevice(deviceId, context);
   try {
+    context?.signal.throwIfAborted();
     console.error('Requesting playback queue...');
     const response = await atv.requestPlaybackQueue({ location: 0, length: 20, includeMetadata: true });
     const items = contentItems(response);
-    if (json) return { items: items.map((item) => {
+    if (json) return { deviceId: commandDeviceIds.get(atv) ?? atv.deviceId, data: { items: items.map((item) => {
       const metadata = item.metadata as Record<string, unknown> | undefined;
       return {
         id: typeof item.identifier === 'string' ? item.identifier : null,
         title: typeof metadata?.title === 'string' ? metadata.title : null,
-        artist: typeof metadata?.artist === 'string' ? metadata.artist : null,
-        album: typeof metadata?.album === 'string' ? metadata.album : null,
+        artist: typeof metadata?.trackArtistName === 'string' ? metadata.trackArtistName : typeof metadata?.albumArtistName === 'string' ? metadata.albumArtistName : null,
+        album: typeof metadata?.albumName === 'string' ? metadata.albumName : null,
       };
-    }) };
+    }) } };
     if (items.length > 0) {
       items.forEach((item, i) => {
         const metadata = item.metadata as Record<string, unknown> | undefined;
@@ -328,25 +354,26 @@ async function cmdQueue(deviceId?: string, json = false): Promise<Record<string,
         console.log(`  ${i + 1}. ${title}`);
       });
     } else console.log('No items in playback queue.');
-  } finally {
+  } catch (error) { commandFailure(error, atv); } finally {
     await atv.close();
   }
 }
 
 /** `atv artwork [device] [file]`: save 600x600 now-playing artwork (default artwork.jpg). */
-async function cmdArtwork(deviceId?: string, outputFile?: string, json = false): Promise<Record<string, unknown> | void> {
-  const atv = await connectToDevice(deviceId);
+async function cmdArtwork(deviceId?: string, outputFile?: string, json = false, context?: JsonOperationContext): Promise<JsonCommandResult | void> {
+  const atv = await connectToDevice(deviceId, context);
   try {
+    context?.signal.throwIfAborted();
     console.error('Requesting artwork...');
     const artwork = await atv.requestArtwork(600, 600);
     if (artwork) {
       const filename = outputFile ?? 'artwork.jpg';
       writeFileSync(filename, artwork);
-      if (json) return { path: filename, bytes: artwork.length, available: true };
+      if (json) return { deviceId: commandDeviceIds.get(atv) ?? atv.deviceId, data: { path: filename, bytes: artwork.length, available: true } };
       console.log(`Artwork saved to ${filename} (${artwork.length} bytes)`);
-    } else if (json) return { available: false };
+    } else if (json) return { deviceId: commandDeviceIds.get(atv) ?? atv.deviceId, data: { available: false } };
     else console.log('No artwork available.');
-  } finally {
+  } catch (error) { commandFailure(error, atv); } finally {
     await atv.close();
   }
 }
@@ -642,63 +669,138 @@ type JsonRecord = {
   data: Record<string, unknown>;
 };
 
-/**
- * Writes complete JSON lines without changing console. State updates may replace an older queued
- * update of the same kind; terminal records are never coalesced or discarded.
- */
-class JsonLineWriter {
-  private queue: { record: JsonRecord; key?: string }[] = [];
-  private writing = false;
-  private closed = false;
-  private readonly limit = 128;
+interface JsonCommandResult { data: Record<string, unknown>; deviceId?: string }
+interface JsonOperationContext {
+  signal: AbortSignal;
+  select(id: string): void;
+  register(client: AppleTV): void;
+}
 
-  write(record: JsonRecord, key?: string): void {
+function commandFailure(error: unknown, client: AppleTV): never {
+  const id = commandDeviceIds.get(client);
+  if (error && typeof error === 'object' && id) commandErrorDeviceIds.set(error, id);
+  throw error;
+}
+
+class JsonOutputError extends Error {}
+class JsonOutputStalledError extends JsonOutputError {}
+class JsonOutputLimitError extends Error {}
+
+/** Bounded complete JSON lines; only queued replaceable state is evicted under backpressure. */
+class JsonLineWriter {
+  private queue: { line: string; bytes: number; key?: string }[] = [];
+  private queueBytes = 0;
+  private closed = false;
+  private failure?: Error;
+  private draining?: Promise<void>;
+  private finishing?: Promise<void>;
+  private cancelWrite?: (error: Error) => void;
+  private closedHandler?: () => void;
+  private readonly failed = (error: unknown) => this.fail(error);
+  private readonly outputClosed = () => this.fail(new Error('Output closed'));
+
+  constructor() {
+    process.stdout.on('error', this.failed);
+    process.stdout.on('close', this.outputClosed);
+  }
+
+  write(record: JsonRecord, key?: string, terminal = false): void {
     if (this.closed) return;
-    if (key) {
-      const existing = this.queue.find((entry) => entry.key === key);
-      if (existing) { existing.record = record; return; }
+    let line: string;
+    try { line = `${JSON.stringify(record)}\n`; } catch (error) { this.fail(error); return; }
+    const bytes = Buffer.byteLength(line);
+    if (bytes > 1024 * 1024) { this.fail(new JsonOutputLimitError('JSON record exceeds 1 MiB')); return; }
+    terminal ||= record.type !== 'event';
+    const full = () => this.queue.length >= 128 || this.queueBytes > 1024 * 1024 - bytes;
+    if (full()) {
+      if (key) {
+        const previous = this.queue.findIndex(entry => entry.key === key);
+        if (previous >= 0) this.queueBytes -= this.queue.splice(previous, 1)[0].bytes;
+      }
+      while (full()) {
+        const replaceable = this.queue.findIndex(entry => entry.key !== undefined);
+        if (replaceable < 0) break;
+        this.queueBytes -= this.queue.splice(replaceable, 1)[0].bytes;
+      }
+      if (full()) {
+        if (key && !terminal) return;
+        this.fail(new JsonOutputLimitError('JSON output queue exceeds its bounded capacity')); return;
+      }
     }
-    if (this.queue.length >= this.limit && key) return;
-    this.queue.push({ record, key });
-    void this.drain();
+    this.queue.push({ line, bytes, key });
+    this.queueBytes += bytes;
+    this.start();
+  }
+
+  private start(): void {
+    if (this.draining || this.closed) return;
+    const task = this.drain();
+    this.draining = task;
+    void task.then(() => {
+      if (this.draining === task) this.draining = undefined;
+      if (this.queue.length && !this.closed) this.start();
+    });
   }
 
   private async drain(): Promise<void> {
-    if (this.writing) return;
-    this.writing = true;
-    try {
-      while (this.queue.length && !this.closed) {
-        const { record } = this.queue.shift()!;
-        try {
-          if (!process.stdout.write(`${JSON.stringify(record)}\n`)) {
-            await new Promise<void>((resolve, reject) => {
-              const complete = () => {
-                process.stdout.removeListener('error', failed);
-                resolve();
-              };
-              const failed = (error: Error) => {
-                process.stdout.removeListener('drain', complete);
-                reject(error);
-              };
-              process.stdout.once('drain', complete);
-              process.stdout.once('error', failed);
-            });
+    while (this.queue.length && !this.closed) {
+      const { line, bytes } = this.queue.shift()!;
+      this.queueBytes -= bytes;
+      try {
+        // One outstanding write bounds the stream buffer; its callback also covers asynchronous EPIPE.
+        await new Promise<void>((resolve, reject) => {
+          let settled = false;
+          const settle = (error?: Error | null) => {
+            if (settled) return;
+            settled = true;
+            clearTimeout(timer);
+            this.cancelWrite = undefined;
+            if (error) reject(error); else resolve();
+          };
+          const timer = setTimeout(() => {
+            this.fail(new JsonOutputStalledError('JSON output did not drain within 2000ms'));
+          }, 2000);
+          this.cancelWrite = error => settle(error);
+          try { process.stdout.write(line, settle); } catch (error) {
+            settle(error instanceof Error ? error : new Error('JSON output failed'));
           }
-        } catch (error: unknown) {
-          if ((error as NodeJS.ErrnoException).code === 'EPIPE') this.closed = true;
-          else throw error;
-        }
-      }
-    } finally {
-      this.writing = false;
+        });
+      } catch (error) { this.fail(error); }
     }
   }
 
-  async finish(): Promise<void> {
-    await this.drain();
+  private fail(cause: unknown): void {
+    if (this.failure) return;
+    this.failure = cause instanceof JsonOutputError || cause instanceof JsonOutputLimitError
+      ? cause : new JsonOutputError('JSON output is unavailable', { cause });
+    this.closed = true;
+    this.queue = [];
+    this.queueBytes = 0;
+    this.cancelWrite?.(this.failure);
+    this.closedHandler?.();
   }
 
-  close(): void { this.closed = true; this.queue = []; }
+  onClosed(handler?: () => void): void {
+    this.closedHandler = handler;
+    if (this.failure) handler?.();
+  }
+
+  finish(): Promise<void> {
+    return this.finishing ??= this.complete();
+  }
+
+  private async complete(): Promise<void> {
+    while (this.draining || (this.queue.length && !this.closed)) {
+      if (!this.draining) this.start();
+      await this.draining;
+    }
+    // Absorb a stream error scheduled after its write callback before detaching the observer.
+    await new Promise<void>(resolve => setImmediate(resolve));
+    process.stdout.removeListener('error', this.failed);
+    process.stdout.removeListener('close', this.outputClosed);
+    this.closed = true;
+    if (this.failure) throw this.failure;
+  }
 }
 
 function jsonRecord(type: JsonRecord['type'], command: string, data: Record<string, unknown>, deviceId?: string): JsonRecord {
@@ -714,117 +816,200 @@ function playbackData(info: NowPlayingInfo): Record<string, unknown> {
   return {
     hasPlayback: info.hasPlayback, playerIdentifier: info.playerIdentifier || null,
     title: info.title || null, artist: info.artist || null, album: info.album || null,
-    genre: info.genre || null, duration: info.duration, elapsedTime: info.elapsedTime,
-    playbackRate: info.playbackRate, playbackState: states[info.playbackState] ?? 'unknown',
+    genre: info.genre || null,
+    duration: Number.isFinite(info.duration) ? info.duration : null,
+    elapsedTime: Number.isFinite(info.elapsedTime) ? info.elapsedTime : null,
+    playbackRate: Number.isFinite(info.playbackRate) ? info.playbackRate : null,
+    playbackState: states[info.playbackState] ?? 'unknown',
     appDisplayName: info.appDisplayName || null, appBundleIdentifier: info.appBundleIdentifier || null,
   };
 }
 
 function jsonError(error: unknown): Record<string, unknown> {
-  const message = error instanceof Error ? error.message : String(error);
-  const protocol = error && typeof error === 'object' && 'errorCode' in error
-    ? error.errorCode : error && typeof error === 'object' && 'code' in error ? error.code : undefined;
+  const detail = error instanceof Error ? error.message : '';
+  const protocol = error && typeof error === 'object' && 'errorCode' in error ? error.errorCode : undefined;
   let code = 'operation_failed';
-  if (/Unsupported in JSON mode/i.test(message)) code = 'unsupported';
-  else if (/Usage:|Unknown command|Invalid |must be |nonblank|unsupported/i.test(message)) code = 'invalid_arguments';
-  else if (/credentials|paired device|companion credentials/i.test(message)) code = 'credentials_unavailable';
-  else if (/No text field is focused|not focused/i.test(message)) code = 'text_unfocused';
-  return { code, message, ...(typeof protocol === 'number' ? { protocolCode: protocol } : {}) };
+  let message = 'Operation failed';
+  if (error instanceof JsonOutputLimitError) { code = 'output_limit'; message = error.message; }
+  else if (/Unsupported in JSON mode/i.test(detail)) { code = 'unsupported'; message = detail; }
+  else if (/No text field is focused|not focused/i.test(detail)) { code = 'text_unfocused'; message = 'No text field is focused'; }
+  else if (error instanceof SyntaxError || /credentials|paired device/i.test(detail)) {
+    code = 'credentials_unavailable'; message = 'Pairing credentials are unavailable or invalid';
+  } else if (/Usage:|Unknown command|Invalid |must be |nonblank|unsupported/i.test(detail)) {
+    code = 'invalid_arguments'; message = 'Invalid command arguments';
+  } else if (typeof protocol === 'number' && Number.isSafeInteger(protocol)) {
+    code = 'protocol_error'; message = 'Device rejected the operation';
+  } else if (/timeout|timed out|closed|ECONN|EHOST|ENET/i.test(detail)) {
+    code = 'transport_error'; message = 'Control transport failed';
+  }
+  return { code, message, ...(typeof protocol === 'number' && Number.isSafeInteger(protocol) ? { protocolCode: protocol } : {}) };
 }
 
 async function cmdJsonWatch(deviceId: string | undefined, writer: JsonLineWriter): Promise<void> {
-  const { id, credentials } = loadCredentials(deviceId);
-  // A watch is one session: discovery is intentionally not retried after it begins emitting.
-  const device = await findDevice(id, 'mrp');
-  const atv = new AppleTV(device);
+  const controller = new AbortController();
+  let id: string | undefined;
+  let atv: AppleTV | undefined;
   let terminal = false;
-  let observedPlayback = false;
-  let complete: (() => void) | undefined;
+  let closing: Promise<void> | undefined;
+  const removers: Array<() => void> = [];
+  let resolveDone!: () => void;
+  const done = new Promise<void>(resolve => { resolveDone = resolve; });
   const emit = (name: string, data: Record<string, unknown>, key?: string) => {
     if (!terminal) writer.write(jsonRecord('event', name, data, id), key);
   };
-  const finish = async (name: string, data: Record<string, unknown>, exitCode = 0) => {
+  const stop = (name: string, data: Record<string, unknown>, exitCode: number, output = true) => {
     if (terminal) return;
     terminal = true;
-    writer.write(jsonRecord('event', name, data, id));
-    complete?.();
-    await atv.close();
+    controller.abort();
+    if (output) writer.write(jsonRecord('event', name, data, id), undefined, true);
     process.exitCode = exitCode;
+    resolveDone();
+    closing = atv?.close() ?? Promise.resolve();
   };
-  const onSignal = () => { void finish('watch-close', { reason: 'signal' }, 130); };
-  process.once('SIGINT', onSignal);
-  process.once('SIGTERM', onSignal);
-  atv.on('nowPlaying', (info) => { observedPlayback = true; emit('playback', playbackData(info), 'playback'); });
-  atv.on('volume', (volume) => emit('volume', { value: volume }, 'volume'));
-  atv.on('outputDevices', (outputs: { identifier: string; name: string }[]) => emit('output-devices', { devices: outputs.map((d) => ({ id: d.identifier, name: d.name })) }, 'outputs'));
-  atv.on('keyboard', (info: KeyboardInfo) => emit('text-focus', { state: info.focused ? 'focused' : 'unfocused', title: info.title ?? null, prompt: info.prompt ?? null }, 'focus'));
-  atv.on('close', () => { if (!terminal) void finish('connection-close', { intentional: false, transport: 'mrp' }, 1); });
-  atv.on('error', (error: Error) => { if (!terminal) emit('connection-error', jsonError(error)); });
+  const interrupt = () => stop('watch-close', { reason: 'signal', signal: 'SIGINT', intentional: true }, 130);
+  const terminate = () => stop('watch-close', { reason: 'signal', signal: 'SIGTERM', intentional: true }, 143);
+  process.once('SIGINT', interrupt);
+  process.once('SIGTERM', terminate);
+  writer.onClosed(() => stop('watch-close', { reason: 'stdout_closed', intentional: true }, 1, false));
   try {
-    await atv.connect(credentials, { settleMs: settleMs() });
-    emit('connection', { transport: 'mrp', state: 'connected' });
-    if (observedPlayback) emit('playback', playbackData(atv.nowPlaying), 'playback');
-    else emit('playback', { state: 'unknown' }, 'playback');
-    emit('volume', { value: atv.volume ?? null, state: atv.volume === undefined ? 'unknown' : 'known' }, 'volume');
-    emit('output-devices', { devices: atv.outputDevices.map((d) => ({ id: d.identifier, name: d.name })) }, 'outputs');
-    if (credentials.companionCredentials && device.companionPort) {
-      atv.on('powerState', (state) => emit('power', { state }, 'power'));
-      atv.on('textFocusState', (state) => emit('text-focus', { state }, 'focus'));
-      atv.on('companionError', (error: Error) => { if (!terminal) emit('connection-error', jsonError(error)); });
-      atv.on('companionClose', () => { if (!terminal) void finish('connection-close', { intentional: false, transport: 'companion' }, 1); });
-      await atv.connectCompanion(credentials.companionCredentials);
-      atv.subscribePowerState();
+    const selected = loadCredentials(deviceId); id = selected.id;
+    // Choose one candidate before emitting. The lifetime is never passed to cache retry.
+    const device = readCachedDevice(DEVICES_FILE, id) ?? await findDevice(id, 'any', controller.signal);
+    if (terminal) return;
+    const client = atv = new AppleTV(device);
+    const hasMRP = !!device.port || !!device.mrpPort && device.mrpEnabled !== false;
+    const hasCompanion = !!selected.credentials.companionCredentials && !!device.companionPort;
+    if (!hasMRP && !hasCompanion) throw new Error('No usable watch transport');
+    const listen = <Args extends unknown[]>(event: string, handler: (...args: Args) => void) => {
+      client.on(event, handler); removers.push(() => client.removeListener(event, handler));
+    };
+    let observedPlayback = false;
+    let observedOutputs = false;
+    let observedVolume = false;
+    let observedPower = false;
+    let observedFocus = false;
+    listen('nowPlaying', (info: NowPlayingInfo) => { observedPlayback = true; emit('playback', playbackData(info), 'playback'); });
+    listen('volume', (volume: number) => {
+      observedVolume = true;
+      const known = Number.isFinite(volume) && volume >= 0 && volume <= 100;
+      emit('volume', { value: known ? volume : null, state: known ? 'known' : 'unknown' }, 'volume');
+    });
+    listen('outputDevices', (outputs: { identifier: string; name: string }[]) => {
+      observedOutputs = true;
+      emit('output-devices', { devices: outputs.map(output => ({ id: output.identifier, name: output.name })), state: 'known' }, 'outputs');
+    });
+    listen('keyboard', (info: KeyboardInfo) => {
+      if (!hasCompanion) { observedFocus = true; emit('text-focus', { state: info.focused ? 'focused' : 'unfocused' }, 'focus'); }
+    });
+    listen('powerState', (state: string) => { observedPower = true; emit('power', { state }, 'power'); });
+    listen('textFocusState', (state: string) => { observedFocus = true; emit('text-focus', { state }, 'focus'); });
+    listen('close', () => stop('connection-close', { intentional: false, transport: 'mrp' }, 1));
+    listen('companionClose', () => stop('connection-close', { intentional: false, transport: 'companion' }, 1));
+    listen('error', (error: Error) => emit('connection-error', jsonError(error), 'mrp-error'));
+    listen('companionError', (error: Error) => emit('connection-error', jsonError(error), 'companion-error'));
+    if (hasMRP) {
+      await client.connect(selected.credentials, { settleMs: settleMs() });
+      if (terminal) return;
+      emit('connection', { transport: 'mrp', state: 'connected' });
+    } else emit('source', { source: 'mrp', state: 'unavailable' });
+    if (!observedPlayback) emit('playback', { state: 'unknown' }, 'playback');
+    if (!observedVolume) emit('volume', { value: client.volume ?? null, state: client.volume === undefined ? hasMRP ? 'unknown' : 'unavailable' : 'known' }, 'volume');
+    if (!observedOutputs) emit('output-devices', { devices: null, state: hasMRP ? 'unknown' : 'unavailable' }, 'outputs');
+    if (hasCompanion) {
+      await client.connectCompanion(selected.credentials.companionCredentials!);
+      if (terminal) return;
+      client.subscribePowerState();
       emit('connection', { transport: 'companion', state: 'connected' });
-      emit('power', { state: atv.powerState }, 'power');
-      emit('text-focus', { state: atv.textFocusState }, 'focus');
-    } else emit('source', { source: 'companion', state: 'unavailable' });
-    await new Promise<void>((resolve) => { complete = resolve; });
+      if (!observedPower) emit('power', { state: client.powerState }, 'power');
+      if (!observedFocus) emit('text-focus', { state: client.textFocusState }, 'focus');
+    } else {
+      emit('source', { source: 'companion', state: 'unavailable' });
+      emit('power', { state: 'unknown', available: false }, 'power');
+      if (!observedFocus) emit('text-focus', { state: 'unknown', available: hasMRP }, 'focus');
+    }
+    await done;
   } catch (error) {
-    // The outer JSON command writer owns the single setup failure record.
-    terminal = true;
-    throw error;
+    if (!terminal) {
+      terminal = true;
+      if (error && typeof error === 'object' && id) commandErrorDeviceIds.set(error, id);
+      throw error;
+    }
   } finally {
-    process.removeListener('SIGINT', onSignal);
-    process.removeListener('SIGTERM', onSignal);
-    await atv.close();
+    terminal = true;
+    process.removeListener('SIGINT', interrupt);
+    process.removeListener('SIGTERM', terminate);
+    writer.onClosed();
+    await (closing ?? atv?.close());
+    for (const remove of removers) remove();
   }
 }
 
 async function mainJson(argv: string[]): Promise<void> {
   const [command, ...args] = argv;
   const writer = new JsonLineWriter();
-  if (!command || ['help', '--help', '-h'].includes(command)) {
-    writer.write(jsonRecord('result', 'help', { schemaVersion: JSON_VERSION }));
+  const controller = new AbortController();
+  let active: AppleTV | undefined;
+  let selectedId: string | undefined;
+  let cancelled = false;
+  const cancel = (exitCode: number, signal?: string) => {
+    if (cancelled) return;
+    cancelled = true;
+    controller.abort();
+    process.exitCode = exitCode;
+    if (signal) writer.write(jsonRecord('error', command ?? 'unknown', { code: 'cancelled', message: 'Command cancelled', signal }, selectedId), undefined, true);
+    void active?.close();
+  };
+  const interrupt = () => cancel(130, 'SIGINT');
+  const terminate = () => cancel(143, 'SIGTERM');
+  try {
+    if (!command || ['help', '--help', '-h'].includes(command)) {
+      writer.write(jsonRecord('result', 'help', { schemaVersion: JSON_VERSION }));
+      return;
+    }
+    if (['pair', 'companion-pair', 'dmap-pair', 'dmap', 'remote', 'messages', 'keyboard', 'companion-test', 'raop-stream'].includes(command)) {
+      throw new Error(`Unsupported in JSON mode: ${command}`);
+    }
+    if (command === 'watch') {
+      argumentsFor(args, 0, 'watch [device]');
+      await cmdJsonWatch(args[0], writer);
+      return;
+    }
+    writer.onClosed(() => cancel(1));
+    process.once('SIGINT', interrupt);
+    process.once('SIGTERM', terminate);
+    if (command === 'scan') {
+      argumentsFor(args, 0, 'scan');
+      const devices = await scan({ timeout: 5000, signal: controller.signal });
+      if (!cancelled) writer.write(jsonRecord('result', 'scan', { devices: devices.map(device => ({
+        id: device.deviceId, name: device.name, address: device.address, port: device.port, model: device.model, psi: device.airplayPsi ?? null,
+      })) }));
+      return;
+    }
+    const context: JsonOperationContext = {
+      signal: controller.signal,
+      select: id => { selectedId = id; },
+      register: client => { active = client; },
+    };
+    const result = await main(argv, true, context);
+    if (cancelled) return;
+    if (!result) throw new Error('JSON command produced no result');
+    writer.write(jsonRecord('result', command, result.data, result.deviceId));
+  } catch (error) {
+    if (!cancelled) {
+      if (error && typeof error === 'object' && selectedId) commandErrorDeviceIds.set(error, selectedId);
+      throw error;
+    }
+  } finally {
+    process.removeListener('SIGINT', interrupt);
+    process.removeListener('SIGTERM', terminate);
+    writer.onClosed();
+    await active?.close();
     await writer.finish();
-    return;
   }
-  if (['pair', 'companion-pair', 'dmap-pair', 'dmap', 'remote', 'messages', 'keyboard', 'companion-test', 'raop-stream'].includes(command)) {
-    throw new Error(`Unsupported in JSON mode: ${command}`);
-  }
-  if (command === 'watch') {
-    argumentsFor(args, 0, 'watch [device]');
-    await cmdJsonWatch(args[0], writer);
-    await writer.finish();
-    return;
-  }
-  if (command === 'scan') {
-    argumentsFor(args, 0, 'scan');
-    const devices = await scan({ timeout: 5000 });
-    writer.write(jsonRecord('result', 'scan', { devices: devices.map((d) => ({
-      id: d.deviceId, name: d.name, address: d.address, port: d.port, model: d.model, psi: d.airplayPsi ?? null,
-    })) }));
-    await writer.finish();
-    return;
-  }
-  // Reuse the normal dispatcher operations, but route their concrete return values through the writer.
-  const result = await main(argv, true);
-  if (!result) throw new Error('JSON command produced no result');
-  writer.write(jsonRecord('result', command, result.data, result.deviceId));
-  await writer.finish();
 }
 
 /** Validate and dispatch CLI arguments. Errors propagate to the executable's exit handler. */
-export async function main(argv: string[], jsonInternal = false): Promise<{ data: Record<string, unknown>; deviceId?: string } | void> {
+export async function main(argv: string[], jsonInternal = false, context?: JsonOperationContext): Promise<JsonCommandResult | void> {
   if (!jsonInternal) {
     const jsonIndexes = argv.reduce<number[]>((indexes, value, index) => value === '--json' ? [...indexes, index] : indexes, []);
     if (jsonIndexes.length > 1) {
@@ -841,8 +1026,12 @@ export async function main(argv: string[], jsonInternal = false): Promise<{ data
       try {
         await mainJson(jsonArgv);
       } catch (error) {
+        process.exitCode = 1;
+        if (error instanceof JsonOutputStalledError) throw error;
+        if (error instanceof JsonOutputError) return;
         const writer = new JsonLineWriter();
-        writer.write(jsonRecord('error', jsonArgv[0] ?? 'unknown', jsonError(error)));
+        const id = error && typeof error === 'object' ? commandErrorDeviceIds.get(error) : undefined;
+        writer.write(jsonRecord('error', jsonArgv[0] ?? 'unknown', jsonError(error), id));
         await writer.finish();
         process.exitCode = 1;
       }
@@ -854,14 +1043,15 @@ export async function main(argv: string[], jsonInternal = false): Promise<{ data
   let companion = false;
   // Queries get a reply; every other operation ends with an unacknowledged send (HID key, `_tiC`, ...).
   let acknowledged = false;
+  let waitAfterSend = true;
   let device: string | undefined;
   let operation: (atv: AppleTV) => Promise<void | string | App[] | UserAccount[]>;
   switch (cmd) {
     case 'command': case 'cmd': {
       const { action, rest } = splitAction(args, 1);
       argumentsFor(rest, 1, 'command <key> [action] [device]');
-      const result = await cmdCommand(rest[0], action, rest[1], jsonInternal);
-      return jsonInternal ? { data: result ?? { acknowledged: false }, deviceId: rest[1] } : undefined;
+      const result = await cmdCommand(rest[0], action, rest[1], jsonInternal, context);
+      return jsonInternal ? result : undefined;
     }
     case 'click': {
       const { action, rest } = splitAction(args, 0);
@@ -884,7 +1074,7 @@ export async function main(argv: string[], jsonInternal = false): Promise<{ data
     case 'output': {
       const [action, ...values] = args;
       // Routing resolves only once the TV reports the new group, so no post-send wait is needed.
-      acknowledged = true;
+      acknowledged = true; waitAfterSend = false;
       // Rows reuse the printer's `id\tname` format.
       const rows = (atv: AppleTV) => atv.outputDevices.map((d) => ({ id: d.identifier, name: d.name }));
       if (action === 'list') {
@@ -919,6 +1109,7 @@ export async function main(argv: string[], jsonInternal = false): Promise<{ data
       argumentsFor(args, 0, `${cmd} [device]`);
       device = args[0]; companion = cmd === 'power';
       acknowledged = true;
+      waitAfterSend = cmd !== 'power';
       operation = cmd === 'stop' ? (atv) => atv.stop() : (atv) => atv.fetchPowerState();
       break;
     case 'seek': case 'skip-forward': case 'skip-backward': case 'volume': {
@@ -948,7 +1139,7 @@ export async function main(argv: string[], jsonInternal = false): Promise<{ data
         device = values[0]; operation = (atv) => atv.clearText();
       } else if (action === 'focus') {
         argumentsFor(values, 0, 'text focus [device]');
-        device = values[0]; acknowledged = true;
+        device = values[0]; acknowledged = true; waitAfterSend = false;
         operation = (atv) => atv.fetchTextFocusState();
       } else if (action === 'set' || action === 'append') {
         // Empty text is valid; unlike identifiers it must not be trimmed or rejected.
@@ -963,11 +1154,12 @@ export async function main(argv: string[], jsonInternal = false): Promise<{ data
       companion = true;
       if (action === 'list') {
         argumentsFor(values, 0, `${cmd} list [device]`);
-        device = values[0]; acknowledged = true;
+        device = values[0]; acknowledged = true; waitAfterSend = false;
         operation = (atv) => cmd === 'app' ? atv.appList() : atv.accountList();
       } else if (action === (cmd === 'app' ? 'launch' : 'switch')) {
         argumentsFor(values, 1, `${cmd} ${action} <id> [device]`);
         device = values[1];
+        acknowledged = true;
         operation = (atv) => cmd === 'app' ? atv.launchApp(values[0]) : atv.switchAccount(values[0]);
       } else throw new Error(`Invalid ${cmd} operation: ${action ?? '(missing)'}`);
       break;
@@ -979,12 +1171,12 @@ export async function main(argv: string[], jsonInternal = false): Promise<{ data
     case 'remote': case 'state': case 'queue': case 'messages': case 'keyboard': case 'companion-test':
       argumentsFor(args, 0, `${cmd} [device]`);
       if (cmd === 'state') {
-        const result = await cmdState(args[0], jsonInternal);
-        return jsonInternal ? { data: result ?? {}, deviceId: args[0] } : undefined;
+        const result = await cmdState(args[0], jsonInternal, context);
+        return jsonInternal ? result : undefined;
       }
       if (cmd === 'queue') {
-        const result = await cmdQueue(args[0], jsonInternal);
-        return jsonInternal ? { data: result ?? {}, deviceId: args[0] } : undefined;
+        const result = await cmdQueue(args[0], jsonInternal, context);
+        return jsonInternal ? result : undefined;
       }
       if (jsonInternal) throw new Error(`Unsupported in JSON mode: ${cmd}`);
       switch (cmd) {
@@ -997,26 +1189,27 @@ export async function main(argv: string[], jsonInternal = false): Promise<{ data
     case 'artwork':
       if (args.length > 2) throw new Error('Usage: atv artwork [device] [output.jpg]');
       {
-        const result = await cmdArtwork(args[0], args[1], jsonInternal);
-        return jsonInternal ? { data: result ?? {}, deviceId: args[0] } : undefined;
+        const result = await cmdArtwork(args[0], args[1], jsonInternal, context);
+        return jsonInternal ? result : undefined;
       }
     default: throw new Error(`Unknown command: ${cmd}. Run "atv --help".`);
   }
-  const atv = await (companion ? connectToCompanion(device) : connectToDevice(device));
+  const atv = await (companion ? connectToCompanion(device, context) : connectToDevice(device, context));
   try {
+    context?.signal.throwIfAborted();
     const result = await operation(atv);
     // Give unacknowledged sends time to reach the TV before close() destroys the socket.
-    if (!acknowledged) await delay(postSendMs());
+    if (waitAfterSend) await delay(postSendMs(), undefined, { signal: context?.signal });
     if (jsonInternal) {
       const data = Array.isArray(result)
         ? { items: result.map((item) => 'bundleId' in item ? { id: item.bundleId, name: item.name } : { id: item.id, name: item.name }), acknowledged }
         : result === undefined ? { acknowledged } : { value: result, acknowledged };
-      return { data, deviceId: device };
+      return { data, deviceId: commandDeviceIds.get(atv) ?? atv.deviceId };
     }
     if (Array.isArray(result)) {
       for (const item of result) console.log(`${'bundleId' in item ? item.bundleId : item.id}\t${item.name}`);
     } else if (result !== undefined) console.log(result);
-  } finally {
+  } catch (error) { commandFailure(error, atv); } finally {
     await atv.close();
   }
 }
@@ -1027,6 +1220,9 @@ let isScript = false;
 try { isScript = Boolean(process.argv[1]) && import.meta.url === pathToFileURL(realpathSync(process.argv[1])).href; } catch { /* not the script */ }
 if (isScript) {
   main(process.argv.slice(2)).catch((error: unknown) => {
+    // Node cannot destroy its special stdout stream while a pipe write is pending.
+    // The command has already awaited owned-transport cleanup; only the executable may force exit.
+    if (error instanceof JsonOutputStalledError) process.exit(1);
     console.error(`Error: ${error instanceof Error ? error.message : String(error)}`);
     process.exitCode = 1;
   });
