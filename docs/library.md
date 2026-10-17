@@ -35,6 +35,9 @@ not use recursive DNS, bypass routing/firewall/NAT/client-isolation limits, or p
 device is reachable, awake, or trusted. Discovery records are unauthenticated: complete normal
 pairing and cryptographic connection verification before trusting a result.
 
+Targeted discovery closes its UDP sockets and retry timer with the scan. Closing
+during asynchronous socket setup cannot restart querying or leave a retry timer alive.
+
 ## Optional storage
 
 Storage is opt-in: existing explicit credentials never cause filesystem access. Call

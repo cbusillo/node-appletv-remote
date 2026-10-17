@@ -77,20 +77,41 @@ export class TargetedMdns {
   private retry: ReturnType<typeof setInterval> | undefined;
   private closed = false;
   constructor(private readonly targets: Target[], private readonly found: (service: TargetedService) => void, private readonly fail: (error: Error) => void, private readonly port = 5353, private readonly bindPort = 0) {}
-  async start(): Promise<void> { await Promise.all(this.targets.map(target => this.open(target))); this.sendQuestions(); this.retry = setInterval(() => this.sendQuestions(), 750); }
+  async start(): Promise<void> {
+    if (this.closed) return;
+    await Promise.all(this.targets.map(target => this.open(target)));
+    if (this.closed) return;
+    this.sendQuestions();
+    this.retry = setInterval(() => this.sendQuestions(), 750);
+  }
   close(): void { if (this.closed) return; this.closed = true; clearInterval(this.retry); for (const state of this.states) { state.querySocket.close(); state.listener?.close(); } }
   private open(target: Target): Promise<void> {
     return new Promise((resolve, reject) => {
       const querySocket = dgram.createSocket({ type: target.family === 4 ? 'udp4' : 'udp6', reuseAddr: true }); const state: State = { target, querySocket, cache: newCache() }; this.states.push(state);
-      const fail = (error: Error) => { if (!this.closed) { this.close(); reject(error); } };
+      const fail = (error: Error) => { if (!this.closed) this.close(); reject(error); };
+      querySocket.once('close', resolve);
       querySocket.once('error', fail); querySocket.on('message', (packet, rinfo) => this.receive(packet, state, rinfo.address));
-      querySocket.bind(this.bindPort, () => { querySocket.off('error', fail); querySocket.on('error', error => this.fail(error)); this.openListener(state, resolve, reject); });
+      querySocket.bind(this.bindPort, () => {
+        if (this.closed) { resolve(); return; }
+        querySocket.off('error', fail);
+        querySocket.on('error', error => this.fail(error));
+        this.openListener(state, resolve, reject);
+      });
     });
   }
   private openListener(state: State, resolve: () => void, reject: (error: Error) => void): void {
     const listener = dgram.createSocket({ type: state.target.family === 4 ? 'udp4' : 'udp6', reuseAddr: true }); state.listener = listener;
+    listener.once('close', resolve);
     listener.once('error', reject); listener.on('message', (packet, rinfo) => this.receive(packet, state, rinfo.address));
-    listener.bind(5353, () => { try { listener.addMembership(state.target.family === 4 ? '224.0.0.251' : 'ff02::fb', state.target.family === 6 ? state.target.scope : undefined); listener.off('error', reject); listener.on('error', error => this.fail(error)); resolve(); } catch (error) { reject(error as Error); } });
+    listener.bind(5353, () => {
+      if (this.closed) { resolve(); return; }
+      try {
+        listener.addMembership(state.target.family === 4 ? '224.0.0.251' : 'ff02::fb', state.target.family === 6 ? state.target.scope : undefined);
+        listener.off('error', reject);
+        listener.on('error', error => this.fail(error));
+        resolve();
+      } catch (error) { reject(error as Error); }
+    });
   }
   private sendQuestions(): void { if (this.closed) return; for (const state of this.states) { state.cache.queries.clear(); for (const type of SERVICE_TYPES) this.ask(state, SERVICE_NAMES[type], 12); for (const instances of state.cache.ptrs.values()) for (const instance of instances) { this.ask(state, instance, 33); this.ask(state, instance, 16); } for (const srv of state.cache.srvs.values()) { this.ask(state, srv.host, 1); this.ask(state, srv.host, 28); } } }
   private ask(state: State, name: string, type: number): void { if (!name || state.cache.queries.size >= MAX_RECORDS) return; const key = `${name}/${type}`; if (state.cache.queries.has(key)) return; state.cache.queries.add(key); let packet: Buffer; try { packet = query(name, type); } catch { return; } state.querySocket.send(packet, this.port, state.target.address, error => { if (error && !this.closed) this.fail(error); }); }
