@@ -33,7 +33,8 @@ async function bind(address: string) {
 describe('targeted mDNS', () => {
   it('validates literals and requires a link-local IPv6 scope', () => {
     expect(parseTargets(['192.0.2.7', '2001:db8::7%en0'])).toEqual([
-      { address: '192.0.2.7', family: 4, scope: undefined }, { address: '2001:db8::7%en0', family: 6, scope: 'en0' },
+      { address: '192.0.2.7', family: 4, scope: undefined, canonical: '192.0.2.7' },
+      { address: '2001:db8::7%en0', family: 6, scope: 'en0', canonical: '2001:db8::7' },
     ]);
     expect(() => parseTargets(['', 'host.example', 'fe80::1'])).toThrow('Invalid discovery host: ');
     expect(() => parseTargets(['fe80::1'])).toThrow('requires a scope');
