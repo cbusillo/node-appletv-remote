@@ -191,6 +191,44 @@ describe('legacy RAOP streaming', () => {
     expect(peer.resends[0].subarray(4)).toEqual(peer.packets[0]);
     expect(peer.requests.at(-1)!.headers.session).toBe('test-session');
   }, 5000);
+  it('sends bounded JPEG artwork and rounded progress after SETUP before RECORD', async () => {
+    const module = await load(); const peer = await receiver();
+    useControlledClock();
+    await new module.RaopStream('127.0.0.1', peer.port, { ...txt, md: '0,1,2' }).stream(Buffer.alloc(4), {
+      metadata: { title: 'Track', artwork: Buffer.from([0xff, 0xd8, 0xff, 0]) }, duration: 0.5,
+    });
+    expect(peer.requests.map(request => request.method)).toEqual(['ANNOUNCE', 'SETUP', 'SET_PARAMETER', 'SET_PARAMETER', 'RECORD', 'FLUSH', 'SET_PARAMETER', 'POST', 'TEARDOWN']);
+    expect(peer.requests[2]).toMatchObject({ headers: { 'content-type': 'text/parameters', session: 'test-session' } });
+    expect(peer.requests[2].headers['rtp-info']).toMatch(/^seq=\d+;rtptime=66150$/);
+    expect(peer.requests[2].body.toString()).toBe('progress: 66150/66150/88200\r\n');
+    expect(peer.requests[3]).toMatchObject({ headers: { 'content-type': 'image/jpeg', session: 'test-session' } });
+    expect(peer.requests[3].headers['rtp-info']).toMatch(/^seq=\d+;rtptime=66150$/);
+    expect(peer.requests[3].body).toEqual(Buffer.from([0xff, 0xd8, 0xff, 0]));
+  }, 5000);
+
+  it('rejects unsupported metadata capabilities and invalid artwork/duration before ownership', async () => {
+    const module = await load(); const peer = await receiver();
+    const source = Readable.from([Buffer.alloc(4)]);
+    for (const options of [
+      { metadata: { artwork: Buffer.from([0xff, 0xd8, 0xff]) } },
+      { duration: 1 },
+      { metadata: { artwork: Buffer.from([0x89, 0x50, 0x4e]) } },
+      { metadata: { artwork: Buffer.alloc(1024 * 1024 + 1, 0xff) } },
+      { duration: Number.NaN },
+    ]) {
+      await expect(new module.RaopStream('127.0.0.1', peer.port, txt).stream(source, options)).rejects.toThrow(/artwork|progress|duration/i);
+      expect(source.destroyed).toBe(false);
+    }
+    expect(peer.requests).toHaveLength(0);
+  });
+  it('rejects unsafe progress frame counts and invalid endpoints before source ownership', async () => {
+    const module = await load(); const source = Readable.from([Buffer.alloc(4)]);
+    await expect(new module.RaopStream('127.0.0.1', 7000, { ...txt, md: '2' }).stream(source, { duration: Number.MAX_VALUE })).rejects.toThrow(/duration/i);
+    expect(source.destroyed).toBe(false);
+    expect(() => new module.RaopStream('hostname', 7000, txt)).toThrow(/IPv4/i);
+    expect(() => new module.RaopStream('127.0.0.1', 0, txt)).toThrow(/port/i);
+  });
+
 
   it('opens the RTSP control connection through the shared cancellable connectSocket helper', async () => {
     const module = await load(); const peer = await receiver(); connectSpy.calls.length = 0;
@@ -260,6 +298,19 @@ describe('legacy RAOP streaming', () => {
     await expect(stream.stream(Buffer.alloc(4))).rejects.toThrow(/one-shot/);
     await expect(stream.setMetadata({ title: 'x' })).rejects.toThrow(/active/);
   });
+  it('validates an active mixed metadata update before sending its text portion', async () => {
+    const module = await load(); const peer = await receiver(); const controller = new AbortController();
+    const stream = new module.RaopStream('127.0.0.1', peer.port, txt);
+    const playing = stream.stream(Buffer.alloc(44100 * 4), { signal: controller.signal });
+    const settled = playing.catch(error => error);
+    try {
+      await waitForIo(() => peer.packets.length > 0);
+      const requests = peer.requests.length;
+      await expect(stream.setMetadata({ title: 'must not send', artwork: Buffer.from([0xff, 0xd8, 0xff]) })).rejects.toThrow(/artwork/i);
+      expect(peer.requests).toHaveLength(requests);
+    } finally { controller.abort(); await settled; }
+  });
+
 
   it('cancels paced streaming promptly and does not send later packets', async () => {
     const module = await load(); expect(module?.RaopStream).toBeTypeOf('function');
