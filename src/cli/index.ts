@@ -15,11 +15,13 @@ import { Credentials } from '../credentials.js';
 import { DmapClient } from '../dmap/client.js';
 import { DmapPairing } from '../dmap/pairing.js';
 import { RaopStream } from '../raop/stream.js';
+import { extractRaopMetadata } from '../raop/metadata.js';
+import { wavPcm } from '../raop/wav.js';
 import { Bonjour, type Service } from 'bonjour-service';
 import { readFileSync, writeFileSync, existsSync, realpathSync, createReadStream } from 'node:fs';
 import { isIPv4 } from 'node:net';
 import { randomInt } from 'node:crypto';
-import { join } from 'node:path';
+import { extname, join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { withCachedDevice } from './device-cache.js';
 import { createInterface } from 'node:readline';
@@ -545,11 +547,15 @@ function findRaopService(address: string): Promise<{ port: number; txt: Record<s
 }
 
 /**
- * `atv raop-stream <ipv4> <file.pcm>` (experimental): stream raw PCM16LE stereo 44.1 kHz to a legacy
- * RAOP receiver via RaopStream. Ctrl+C cancels and tears the session down.
+ * `atv raop-stream <ipv4> <file.pcm|file.wav>` (experimental): stream raw PCM16LE or validated
+ * PCM WAV to a legacy RAOP receiver. Finite WAV files also provide embedded tags/artwork/duration.
  */
 async function cmdRaopStream(address: string, file: string) {
   if (!existsSync(file)) throw new Error(`No such file: ${file}`);
+  const wav = extname(file).toLowerCase() === '.wav';
+  if (!wav && extname(file).toLowerCase() !== '.pcm') throw new Error('RAOP stream input must be a .pcm or PCM16 stereo 44100 Hz .wav file');
+  const extracted = wav ? await extractRaopMetadata(file) : undefined;
+  const metadata = extracted && Object.keys(extracted.metadata).length ? extracted.metadata : undefined;
   console.error(`Resolving _raop._tcp at ${address}...`);
   const { port, txt } = await findRaopService(address);
   const sender = new RaopStream(address, port, txt);
@@ -558,7 +564,11 @@ async function cmdRaopStream(address: string, file: string) {
   process.once('SIGINT', cancel);
   try {
     console.error(`Streaming ${file} to ${address}:${port} (Ctrl+C to stop)...`);
-    await sender.stream(createReadStream(file, { highWaterMark: 65536 }), { signal: cancellation.signal });
+    await sender.stream(wav ? wavPcm(createReadStream(file)) : createReadStream(file, { highWaterMark: 65536 }), {
+      signal: cancellation.signal,
+      ...(metadata === undefined ? {} : { metadata }),
+      ...(extracted?.duration === undefined ? {} : { duration: extracted.duration }),
+    });
     console.log('Stream complete.');
   } finally {
     process.removeListener('SIGINT', cancel);
@@ -596,8 +606,8 @@ function help(): void {
                                        its deviceid (MAC) or pi will time out
   atv dmap-pair <local-ipv4>           Pair a legacy (DMAP) Apple TV; address is THIS computer's
   atv dmap <command|state> [device]    Legacy DMAP control: ${Object.keys(DMAP_COMMANDS).join(', ')}
-  atv raop-stream <ipv4> <file.pcm>    Experimental: stream raw PCM16LE stereo 44.1 kHz to a legacy
-                                       RAOP receiver (no WAV header, no PIN/HAP receivers)
+  atv raop-stream <ipv4> <file.pcm|file.wav>
+                                       Experimental: raw PCM16LE or PCM16 stereo 44.1 kHz WAV to a legacy RAOP receiver
   atv remote | state | queue | messages | keyboard | companion-test [device]
   atv artwork [device] [output.jpg]
   atv help | --help | -h
@@ -689,7 +699,7 @@ export async function main(argv: string[]): Promise<void> {
       if (args.length !== 1 || !isIPv4(args[0])) throw new Error('Usage: atv dmap-pair <local-ipv4>');
       return cmdDmapPair(args[0]);
     case 'raop-stream':
-      if (args.length !== 2 || !isIPv4(args[0]) || !args[1].trim()) throw new Error('Usage: atv raop-stream <ipv4> <file.pcm>');
+      if (args.length !== 2 || !isIPv4(args[0]) || !args[1].trim()) throw new Error('Usage: atv raop-stream <ipv4> <file.pcm|file.wav>');
       return cmdRaopStream(args[0], args[1]);
     case 'stop': case 'power':
       argumentsFor(args, 0, `${cmd} [device]`);

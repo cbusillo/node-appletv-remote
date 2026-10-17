@@ -20,14 +20,22 @@ import type { HAPCredentials } from '../auth/types.js';
 /** Finite raw PCM chunks; streamed chunks are Buffers of at most 65,536 bytes. */
 export type RaopPcmSource = Buffer | AsyncIterable<Buffer>;
 
-export interface RaopMetadata { title?: string; artist?: string; album?: string }
+export interface RaopMetadata {
+  title?: string;
+  artist?: string;
+  album?: string;
+  /** JPEG artwork, at most 1 MiB. */
+  artwork?: Buffer;
+}
 export interface RaopStreamOptions {
   /** Cancellation interrupts source reads, setup or playback and performs bounded teardown. */
   signal?: AbortSignal;
   /** Receiver volume percentage, 0 (mute) through 100 (0 dB). */
   volume?: number;
-  /** Text metadata requires the receiver's md=0 advertisement. */
+  /** Text metadata and optional JPEG artwork. */
   metadata?: RaopMetadata;
+  /** Finite media duration in seconds; sends an initial RAOP progress update. */
+  duration?: number;
   /** Previously paired legacy AirPlay seed (32 bytes), NOT HAP credentials. Legacy receivers only. No pairing/storage access. */
   legacySeed?: Buffer;
   /** HAP credentials from `PairSetup` (as stored by `atv pair`). Required for, and only accepted by, AirPlay 2 receivers. */
@@ -152,8 +160,10 @@ export class RaopStream {
   /** `airplay2` when features bit 38 (unified media control) or 48 (CoreUtils pairing) is set, else `legacy`. */
   private readonly profile: 'legacy' | 'airplay2';
   private readonly requiresLegacySeed: boolean;
-  /** md=0 advertised at construction; later caller mutations of the TXT record are ignored. */
+  /** md capabilities captured at construction; later caller mutations of the TXT record are ignored. */
   private readonly textMetadata: boolean;
+  private readonly artworkMetadata: boolean;
+  private readonly progressMetadata: boolean;
   private active = false;
   private used = false;
   private client?: RtspClient;
@@ -163,9 +173,11 @@ export class RaopStream {
   private timestamp = 66150;
   private readonly ssrc = randomBytes(4).readUInt32BE();
   constructor(private address: string, private port: number, txt: Readonly<Record<string, string>>) {
+    if (!isIPv4(address) || !Number.isInteger(port) || port < 1 || port > 65535) throw new Error('Expected IPv4 RAOP address and valid port');
     const has = (name: string, value: string) => txt[name]?.split(',').map(item => item.trim()).includes(value);
     this.textMetadata = !!has('md', '0');
-    if (!isIPv4(address) || !Number.isInteger(port) || port < 1 || port > 65535) throw new Error('Expected IPv4 RAOP address and valid port');
+    this.artworkMetadata = !!has('md', '1');
+    this.progressMetadata = !!has('md', '2');
     const rawFeatures = txt.ft ?? txt.features ?? '0x0';
     const features = /^0x([\da-f]{1,8})(?:,0x([\da-f]{1,8}))?$/i.exec(rawFeatures);
     const flags = [txt.sf ?? '0x0', txt.flags ?? '0x0'];
@@ -195,7 +207,11 @@ export class RaopStream {
   async stream(pcm: RaopPcmSource, options: RaopStreamOptions = {}): Promise<void> {
     if (Buffer.isBuffer(pcm) ? pcm.length === 0 || pcm.length % 4 : !pcm || typeof pcm[Symbol.asyncIterator] !== 'function') throw new Error('Expected non-empty complete PCM16 stereo frames or an async Buffer source');
     if (options.volume !== undefined) this.volumeBody(options.volume);
-    if (options.metadata) this.metadataBody(options.metadata);
+    if (options.metadata) {
+      this.metadataBody(options.metadata);
+      if (options.metadata.artwork !== undefined) this.artworkBody(options.metadata.artwork);
+    }
+    if (options.duration !== undefined) this.progressBody(options.duration);
     if (this.profile === 'airplay2' && !options.credentials) throw new Error('AirPlay 2 RAOP receiver requires HAP credentials');
     if (this.profile === 'airplay2' && options.legacySeed !== undefined) throw new Error('RAOP legacy seed is not used by AirPlay 2 receivers');
     if (this.profile === 'legacy' && options.credentials !== undefined) throw new Error('HAP credentials are not used by legacy RAOP receivers');
@@ -373,6 +389,8 @@ export class RaopStream {
         for (const packet of packets) control.send(packet, remote.port, remote.address, () => {});
       });
       const headers = { Session: this.session, 'RTP-Info': `seq=${this.sequence};rtptime=${this.timestamp}` };
+      if (options.duration !== undefined) await this.setProgress(options.duration, headers);
+      if (options.metadata?.artwork !== undefined) await this.setArtwork(options.metadata.artwork, headers);
       const record = await client.request('RECORD', { ...headers, Range: 'npt=0-' }, undefined, controller.signal);
       // Legacy accepts only the fixed 66150-frame latency. AirPlay 2 receivers choose their own; it is accepted
       // while the 66150-frame send schedule is kept (unverified on hardware).
@@ -380,7 +398,9 @@ export class RaopStream {
       await client.request('FLUSH', headers, undefined, controller.signal);
       this.active = true;
       if (options.volume !== undefined) await this.setVolume(options.volume);
-      if (options.metadata) await this.setMetadata(options.metadata);
+      if (options.metadata && (options.metadata.title !== undefined || options.metadata.artist !== undefined || options.metadata.album !== undefined)) {
+        await this.setMetadata({ title: options.metadata.title, artist: options.metadata.artist, album: options.metadata.album });
+      }
       // Legacy: probe /feedback, then repeat every 25 seconds only if supported. AirPlay 2: send now and
       // every 2 seconds without a probe. The reference starts feedback just before RECORD without waiting;
       // requests here are serialized, so feedback first would hold RECORD up to 5 s on a receiver ignoring
@@ -452,6 +472,7 @@ export class RaopStream {
     return Buffer.from(`volume: ${volume === 0 ? -144 : Number((-30 + volume * 0.3).toFixed(2))}\r\n`);
   }
   private metadataBody(metadata: RaopMetadata): Buffer {
+    if (metadata.title === undefined && metadata.artist === undefined && metadata.album === undefined) return Buffer.alloc(0);
     if (!this.textMetadata) throw new Error('Receiver does not support RAOP text metadata');
     const tags: Buffer[] = [];
     for (const [tag, value] of [['minm', metadata.title], ['asal', metadata.album], ['asar', metadata.artist]]) {
@@ -462,16 +483,45 @@ export class RaopStream {
     }
     return encodeDmap('mlit', Buffer.concat(tags));
   }
+  private artworkBody(artwork: Buffer): Buffer {
+    if (!this.artworkMetadata) throw new Error('Receiver does not support RAOP artwork metadata');
+    if (!Buffer.isBuffer(artwork) || artwork.length < 3 || artwork.length > 1024 * 1024 ||
+      artwork[0] !== 0xff || artwork[1] !== 0xd8 || artwork[2] !== 0xff) throw new Error('RAOP artwork must be a JPEG no larger than 1 MiB');
+    return artwork;
+  }
+  private progressBody(duration: number): Buffer {
+    if (!this.progressMetadata) throw new Error('Receiver does not support RAOP progress metadata');
+    const frames = Math.round(duration * SAMPLE_RATE);
+    if (!Number.isFinite(duration) || duration < 0 || !Number.isSafeInteger(frames) || frames > Number.MAX_SAFE_INTEGER - 0xffffffff) {
+      throw new Error('RAOP duration must have a safely representable non-negative frame count');
+    }
+    const start = this.timestamp;
+    const end = (start + frames) % 0x1_0000_0000;
+    return Buffer.from(`progress: ${start}/${start}/${end}\r\n`);
+  }
   /** Update volume only during active playback. */
   async setVolume(volume: number): Promise<void> {
     const body = this.volumeBody(volume);
     if (!this.active || !this.client) throw new Error('No active RAOP stream');
     await this.client.request('SET_PARAMETER', { Session: this.session!, 'Content-Type': 'text/parameters' }, body, this.cancellation!.signal);
   }
-  /** Send supported title/album/artist tags associated with the current RTP position. */
+  /** Send supported title/album/artist tags and/or JPEG artwork associated with the current RTP position. */
   async setMetadata(metadata: RaopMetadata): Promise<void> {
     const body = this.metadataBody(metadata);
+    const artwork = metadata.artwork === undefined ? undefined : this.artworkBody(metadata.artwork);
     if (!this.active || !this.client) throw new Error('No active RAOP stream');
-    await this.client.request('SET_PARAMETER', { Session: this.session!, 'Content-Type': 'application/x-dmap-tagged', 'RTP-Info': `seq=${this.sequence};rtptime=${this.timestamp}` }, body, this.cancellation!.signal);
+    const headers = { Session: this.session!, 'RTP-Info': `seq=${this.sequence};rtptime=${this.timestamp}` };
+    if (body.length) await this.client.request('SET_PARAMETER', { ...headers, 'Content-Type': 'application/x-dmap-tagged' }, body, this.cancellation!.signal);
+    if (artwork !== undefined) await this.setArtwork(artwork, headers);
+  }
+  private async setArtwork(artwork: Buffer, headers?: Record<string, string>): Promise<void> {
+    const body = this.artworkBody(artwork);
+    if (!this.client) throw new Error('No active RAOP stream');
+    await this.client.request('SET_PARAMETER', { ...(headers ?? { Session: this.session!, 'RTP-Info': `seq=${this.sequence};rtptime=${this.timestamp}` }), 'Content-Type': 'image/jpeg' }, body, this.cancellation!.signal);
+  }
+  private async setProgress(duration: number, headers?: Record<string, string>): Promise<void> {
+    const body = this.progressBody(duration);
+    if (!this.client) throw new Error('No active RAOP stream');
+    await this.client.request('SET_PARAMETER', { ...(headers ?? { Session: this.session!, 'RTP-Info': `seq=${this.sequence};rtptime=${this.timestamp}` }), 'Content-Type': 'text/parameters' }, body, this.cancellation!.signal);
   }
 }
