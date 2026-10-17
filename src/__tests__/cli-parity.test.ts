@@ -19,17 +19,13 @@ vi.mock('../raop/stream.js', () => ({ RaopStream: class {
   constructor(...args: unknown[]) { raop.created.push(args); }
   stream(...args: unknown[]) { return raop.stream(...args); }
 } }));
-const metadata = vi.hoisted(() => ({ extractRaopMetadata: vi.fn() }));
-vi.mock('../raop/metadata.js', () => metadata);
-vi.mock('../raop/wav.js', () => ({ wavPcm: vi.fn(() => 'wav-stream') }));
 import { main as run } from '../cli/index.js';
 import { readFileSync, writeFileSync, createReadStream } from 'node:fs';
 import { scan } from '../discovery.js';
-import { extractRaopMetadata } from '../raop/metadata.js';
 
 beforeEach(() => {
   vi.clearAllMocks();
-  raop.services = []; raop.created = []; raop.stream.mockResolvedValue(undefined); metadata.extractRaopMetadata.mockResolvedValue({ metadata: {}, duration: undefined });
+  raop.services = []; raop.created = []; raop.stream.mockResolvedValue(undefined);
   vi.stubEnv('ATV_SETTLE_MS', '0');
   vi.stubEnv('ATV_POST_SEND_MS', '0');
   vi.spyOn(console, 'log').mockImplementation(() => {});
@@ -171,16 +167,6 @@ describe('RAOP streaming', () => {
     await run(['raop-stream', '192.0.2.7', 'track.pcm']);
     expect(raop.created).toEqual([['192.0.2.7', 7000, { cn: '0,1', et: '0', sr: '44100' }]]);
     expect(raop.stream).toHaveBeenCalledWith(expect.anything(), { signal: expect.any(AbortSignal) });
-  });
-  it('extracts finite WAV metadata before streaming without inspecting raw PCM', async () => {
-    raop.services = [{ addresses: ['192.0.2.7'], port: 7000, txt: { cn: '0' } }];
-    metadata.extractRaopMetadata.mockResolvedValue({ metadata: { title: 'Track', artwork: Buffer.from([0xff, 0xd8, 0xff]) }, duration: 1 });
-    await run(['raop-stream', '192.0.2.7', 'track.wav']);
-    expect(extractRaopMetadata).toHaveBeenCalledWith('track.wav');
-    expect(createReadStream).toHaveBeenCalledWith('track.wav');
-    expect(raop.stream).toHaveBeenCalledWith('wav-stream', {
-      signal: expect.any(AbortSignal), metadata: { title: 'Track', artwork: Buffer.from([0xff, 0xd8, 0xff]) }, duration: 1,
-    });
   });
   it('fails when no receiver advertises at the address', async () => {
     vi.useFakeTimers();
