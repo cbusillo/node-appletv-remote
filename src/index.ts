@@ -15,12 +15,14 @@ export type { OpackValue, OpackDict } from './companion/opack.js';
 export { FrameType, encodeFrame, parseFrames } from './companion/framing.js';
 export type { Frame } from './companion/framing.js';
 export { Credentials, parseCredentials } from './credentials.js';
-export { NowPlayingInfo, PlaybackState } from './now-playing-info.js';
+export { NowPlayingInfo, PlaybackState, MediaType, MediaSubType } from './now-playing-info.js';
 export { SupportedCommand, Command } from './supported-command.js';
 export { Message } from './message.js';
 export { AirPlayConnection } from './connection.js';
 export type { HAPCredentials } from './auth/types.js';
 export type { ScanOptions, DiscoveredDevice, DiscoveredDeviceInfo } from './discovery.js';
+export { DeviceStorage, MemoryStorage, FileStorage, CustomStorage, STORAGE_VERSION } from './storage.js';
+export type { StorageAdapter, StorageDocument, DeviceRecord, DeviceSettings, EndpointHints, ProtocolCredentials, Protocol, FileStorageOptions } from './storage.js';
 
 export { LegacyMRPConnection } from './mrp/legacy-connection.js';
 export { MRPConnection } from './mrp/connection.js';
@@ -53,8 +55,11 @@ export function createClient(info: DiscoveredDeviceInfo, protocol?: 'airplay' | 
   return new AppleTV(info);
 }
 
+export { DeviceSession, connectDevice, KEY_OPERATIONS } from './session.js';
+export type { ControlProtocol, SessionCredentials, SessionOperation, SessionOptions, SessionConnectionEvent } from './session.js';
+
 export { AirPlayPlaybackSession } from './airplay-playback.js';
-export type { AirPlayPlaybackStatus } from './airplay-playback.js';
+export type { AirPlayFilePlaybackOptions, AirPlayPlaybackStatus } from './airplay-playback.js';
 
 /** One-shot PCM audio streaming to legacy RAOP receivers or, with HAP `credentials`, AirPlay 2 realtime receivers (experimental, #22). */
 export { RaopStream } from './raop/stream.js';

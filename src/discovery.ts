@@ -156,14 +156,15 @@ type DiscoveryService = {
 };
 
 function usableAddresses(service: DiscoveryService): string[] {
-  return (service.addresses ?? []).filter((address) => {
-    const family = isIP(address);
-    if (family === 4) return !/^(169\.254\.|127\.|0\.|22[4-9]\.|23\d\.)/.test(address);
-    if (family !== 6) return false;
-    const ip = address.split('%')[0].toLowerCase();
-    return ip !== '::' && ip !== '::1' && !ip.startsWith('ff') &&
-      (!/^fe[89ab]/.test(ip) || address.includes('%'));
-  }).sort((a, b) => (isIP(a) === 4 ? 0 : 1) - (isIP(b) === 4 ? 0 : 1));
+  return (service.addresses ?? []).map(address => ({ address, family: isIP(address.split('%', 1)[0]) }))
+    .filter(({ address, family }) => {
+      if (family === 4) return !/^(169\.254\.|127\.|0\.|22[4-9]\.|23\d\.)/.test(address);
+      if (family !== 6) return false;
+      const ip = address.split('%', 1)[0].toLowerCase();
+      return ip !== '::' && ip !== '::1' && !ip.startsWith('ff') &&
+        (!/^fe[89ab]/.test(ip) || address.includes('%'));
+    }).sort((a, b) => (a.family === 4 ? 0 : 1) - (b.family === 4 ? 0 : 1))
+    .map(({ address }) => address);
 }
 
 /** Browse unauthenticated services; ambiguous associations stay separate. Callback errors stop all browsers. */
