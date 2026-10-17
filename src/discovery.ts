@@ -130,6 +130,8 @@ export interface ScanOptions {
   timeout?: number;
   /** Explicit IP literals to query at their mDNS endpoint as well as normal multicast browsing. */
   hosts?: string[];
+  /** Cancel browsing and release every browser/socket before rejecting. */
+  signal?: AbortSignal;
   /** Keep only devices for which this returns true. */
   filter?: (device: DiscoveredDevice) => boolean;
   /**
@@ -170,6 +172,7 @@ function usableAddresses(service: DiscoveryService): string[] {
 /** Browse unauthenticated services; ambiguous associations stay separate. Callback errors stop all browsers. */
 export async function scan(options: ScanOptions = {}): Promise<DiscoveredDevice[]> {
   const targets = parseTargets(options.hosts ?? []);
+  options.signal?.throwIfAborted();
   type RecordEntry = {
     type: string; service: DiscoveryService; addresses: string[]; txt: Record<string, string>;
     ids: string[]; identity: { mac?: string; mrp?: string; dmap?: string };
@@ -245,6 +248,7 @@ export async function scan(options: ScanOptions = {}): Promise<DiscoveredDevice[
       done = true;
       clearTimeout(timer);
       targeted?.close();
+      options.signal?.removeEventListener('abort', abort);
       for (const browser of browsers) browser.stop();
       instance.destroy();
     };
@@ -256,6 +260,9 @@ export async function scan(options: ScanOptions = {}): Promise<DiscoveredDevice[
         cleanup(); resolve(result);
       } catch (error) { fail(error); }
     };
+    const abort = () => fail(options.signal?.reason ?? new Error('Discovery cancelled'));
+    options.signal?.addEventListener('abort', abort, { once: true });
+    if (options.signal?.aborted) { abort(); return; }
     const scheduleUntil = (): void => {
       if (!options.until || untilQueued) return;
       untilQueued = true;

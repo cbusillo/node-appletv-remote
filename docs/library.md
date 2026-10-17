@@ -153,6 +153,9 @@ device acknowledgments. Correct concurrent result matching depends on the MRP
 transport's request correlation.
 
 `getNowPlaying()`, `nowPlaying` and the `nowPlaying` event share `NowPlayingInfo`.
+The numeric timing getters retain their legacy `0` defaults. `hasDuration`,
+`hasElapsedTime`, and `hasPlaybackRate` distinguish a source-supplied finite value
+(including zero) from missing timing. JSON CLI results use `null` for the latter.
 While connected, `getNowPlaying()` returns the received selected-player snapshot
 without sending a queue request when it has explicit playback state (including
 unknown/stopped), a queue (including an empty queue), or direct now-playing fields.

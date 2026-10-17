@@ -84,7 +84,7 @@ Other models and tvOS versions are untested; reports are welcome.
 | Volume | MRP capability reporting verified; Companion control/reading unverified |
 | Audio output routing | Add/remove verified; `setOutputDevices` and routing errors unverified (#46) |
 | IPv6 (global, ULA, link-local) | Verified for MRP and Companion |
-| AirPlay 2 audio streaming (`RaopStream`) | Verified, incl. WAV input and volume; CLI ffmpeg decoding/remote input unverified on receiver hardware; text metadata not shown on screen (#22) |
+| AirPlay 2 audio streaming (`RaopStream`) | Verified, incl. WAV input and volume; CLI ffmpeg decoding/remote input unverified on receiver hardware; RAOP text/artwork/progress requests accepted but not displayed on tvOS 26.6 (#22, #80) |
 | Text entry and text-focus events | Unverified |
 | Media URL and temporary local-file playback | Unverified |
 | Legacy Apple TV 2/3 (DMAP), legacy RAOP receivers, HomePods | Unverified, no hardware available |
@@ -94,7 +94,7 @@ Other models and tvOS versions are untested; reports are welcome.
 
 - [CLI reference](https://github.com/energee/node-appletv-remote/blob/main/docs/cli.md): every command, device selection, timing knobs
 - [Library guide](https://github.com/energee/node-appletv-remote/blob/main/docs/library.md): pairing, remote control, now-playing state, Companion, lifecycle, gestures, routing, events
-- [Media URL playback and audio streaming](https://github.com/energee/node-appletv-remote/blob/main/docs/audio-and-playback.md): `AirPlayPlaybackSession` (`playUrl` and `playFile`), `RaopStream`, `wavPcm`, `LegacyPairSetup`
+- [Media URL playback and audio streaming](https://github.com/energee/node-appletv-remote/blob/main/docs/audio-and-playback.md): `AirPlayPlaybackSession` (`playUrl` and `playFile`), `RaopStream`, `wavPcm`, `extractRaopMetadata`, `LegacyPairSetup`
 - [Legacy Apple TV 2/3 (DMAP)](https://github.com/energee/node-appletv-remote/blob/main/docs/dmap.md)
 - [Internals](https://github.com/energee/node-appletv-remote/blob/main/docs/internals.md): protocol stack, discovery association rules, raw Companion messages
 - [Contributing](https://github.com/energee/node-appletv-remote/blob/main/CONTRIBUTING.md)

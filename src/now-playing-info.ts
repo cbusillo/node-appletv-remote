@@ -79,6 +79,10 @@ export class NowPlayingInfo {
   /** Position in seconds as of `timestamp`, not live. */
   readonly elapsedTime: number;
   readonly playbackRate: number;
+  /** True only when the source supplied a finite value; preserves explicit zero versus a missing timing field. */
+  readonly hasDuration: boolean;
+  readonly hasElapsedTime: boolean;
+  readonly hasPlaybackRate: boolean;
   readonly playbackState: PlaybackState;
   readonly timestamp: number;
   readonly appDisplayName: string;
@@ -123,6 +127,9 @@ export class NowPlayingInfo {
     this.duration = (nowPlayingPayload.duration as number) ?? 0;
     this.elapsedTime = (nowPlayingPayload.elapsedTime as number) ?? 0;
     this.playbackRate = (nowPlayingPayload.playbackRate as number) ?? 0;
+    this.hasDuration = Number.isFinite(nowPlayingPayload.duration);
+    this.hasElapsedTime = Number.isFinite(nowPlayingPayload.elapsedTime);
+    this.hasPlaybackRate = Number.isFinite(nowPlayingPayload.playbackRate);
     this.timestamp = (nowPlayingPayload.timestamp as number) ?? 0;
     this.playbackState =
       (setStatePayload.playbackState as PlaybackState) ?? PlaybackState.Unknown;

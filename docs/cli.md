@@ -55,6 +55,79 @@ atv raop-stream 192.168.1.20 track.flac      # ffmpeg decodes and resamples othe
 atv raop-stream 192.168.1.20 https://example.test/track.mp3
 atv raop-stream 192.168.1.20 pcm:https://example.test/track.pcm # explicit remote raw PCM
 ```
+## JSON Lines mode
+
+Prefix a supported command with `--json` to receive only UTF-8 JSON Lines on stdout. Diagnostics remain on stderr. Every line is one object with `version: 1`, `type` (`result`, `event`, or `error`), `command`, ISO-8601 `timestamp`, optional selected `deviceId`, and a typed `data` object:
+
+```bash
+atv --json scan
+# {"version":1,"type":"result","command":"scan","timestamp":"...","data":{"devices":[]}}
+atv --json state living-room
+# {"version":1,"type":"result","command":"state","timestamp":"...","deviceId":"living-room","data":{"hasPlayback":false,"playbackState":"unknown","title":null,...}}
+```
+
+One-shot operations emit exactly one `result` or `error`; successful actions contain `data.acknowledged`. `true` means a correlated protocol reply was received, not proof of a visible device effect. `false` means only the protocol write completed. Lists are arrays (`devices` or `items`), queue items contain only scalar identifiers/title/artist/album, and artwork is written to the requested path with `path`, `bytes`, and `available` in its result. Empty strings and unavailable numeric metadata are represented as `null`; numeric zero is preserved. Enum values are stable lowercase strings, with `unknown` whenever the device has not supplied a value. `deviceId` is the resolved paired identity, not a partial input selector.
+
+`atv --json watch [device]` emits normalized `connection`, `playback`, `volume`, `output-devices`, `text-focus`, and (when Companion is available) subscribed `power` events. Initial values explicitly use `unknown`, `unavailable`, or `null` until a provider reports them; no empty playback or output snapshot is invented. Companion-only watches are supported. Provider absence emits a `source` event. A connection loss emits one last `connection-close` event with `intentional: false` and exits nonzero. SIGINT/SIGTERM emits one last `watch-close` with `reason: "signal"`, closes owned transports, and exits 130/143 respectively, including during discovery or setup. Each watch selects one cached or discovered endpoint; its lifetime is never retried through the address cache, and there is no automatic reconnect.
+
+JSON commands use the same typed `FileStorage` credentials, endpoint overrides, and
+`DeviceSession` provider policy as human commands. Watches attach listeners before
+authentication, select one endpoint without cache retry, and close the whole session
+on provider loss. Legacy DMAP providers may supply normalized playback when configured.
+
+State events may coalesce if stdout is slow. The backlog is bounded to 128 records and 1 MiB of queued UTF-8 data, plus the in-flight record; a single record is capped at 1 MiB. Terminal records are never coalesced. Output is drained before completion. A broken pipe, closed stdout, or write stalled for two seconds cancels the command and tears down owned transports instead of leaving subscriptions running. An oversized structured record produces a bounded `output_limit` error when stdout remains writable.
+
+Interactive pairing/prompts, raw diagnostic streams (`messages`, `keyboard`, and `companion-test`), explicit `dmap` commands, and RAOP streaming are rejected in JSON mode before network I/O. JSON error data contains a stable `code` and safe `message`; protocol numeric codes are retained when present, but stacks, credentials, raw payloads, and private keys are never emitted.
+
+The following examples show the `data` object inside the common result envelope.
+Action rows include every supported alias/subcommand; request rejection produces an
+`error` instead of the success object. Empty lists retain the same array shape.
+
+| Command | Example `data` |
+|---|---|
+| `help`, `--help`, `-h` | `{"schemaVersion":1}` |
+| `scan` | `{"devices":[{"id":"tv","name":"TV","address":"192.0.2.1","port":7000,"model":"AppleTV14,1","psi":null}]}` |
+| `state` | `{"hasPlayback":true,"playerIdentifier":null,"title":"Song","artist":null,"album":null,"genre":null,"duration":null,"elapsedTime":0,"playbackRate":0,"playbackState":"paused","appDisplayName":null,"appBundleIdentifier":null}` |
+| `queue` | `{"items":[{"id":"track","title":"Song","artist":"Artist","album":"Album"}]}` |
+| `artwork` | `{"path":"cover.jpg","bytes":1234,"available":true}` |
+| `command up`, `cmd up` | `{"command":"up","action":"singleTap","acknowledged":false}` |
+| `command play`, `command guide` (representative correlated media/Companion buttons) | `{"command":"play","action":"singleTap","acknowledged":true}` (the command field echoes the actual key) |
+| `stop`, `seek`, `skip-forward`, `skip-backward`, `shuffle`, `repeat` | `{"acknowledged":true}` |
+| `volume`, `click`, `swipe` | `{"acknowledged":false}` |
+| `output list`, `output add`, `output remove`, `output set` | `{"items":[{"id":"psi-uuid","name":"Speaker"}],"acknowledged":true}` |
+| `app list`, `account list` | `{"items":[{"id":"identifier","name":"Display name"}],"acknowledged":true}` |
+| `app launch`, `account switch` | `{"acknowledged":true}` |
+| `power` | `{"value":"on","acknowledged":true}` (`on`, `off`, `unknown`) |
+| `text focus` | `{"value":"unfocused","acknowledged":true}` (`focused`, `unfocused`, `unknown`) |
+| `text set`, `text append`, `text clear` | `{"value":"resulting text","acknowledged":false}` (`clear` returns an empty string) |
+
+Watch records have `type: "event"` and the event name in `command`. State sources
+can be absent independently; a Companion-only watch does not fabricate MRP state.
+
+| Event | Example `data` |
+|---|---|
+| `connection` | `{"transport":"companion","state":"connected"}` (transport is `mrp`, `companion`, or `dmap`; AirPlay-carried MRP uses `mrp`) |
+| `source` | `{"source":"mrp","state":"unavailable"}` |
+| `playback` | `{"state":"unknown"}` before observation; afterward the same data shape as `state` above |
+| `volume` | `{"value":32.5,"state":"known"}`; otherwise `value: null` with `state: "unknown"` or `"unavailable"` |
+| `output-devices` | `{"devices":[{"id":"psi-uuid","name":"Speaker"}],"state":"known"}`; unobserved devices are `null`, not an invented empty array |
+| `power` | `{"state":"off"}`; absent Companion reports `{"state":"unknown","available":false}` |
+| `text-focus` | `{"state":"focused"}`; initially `"unknown"` until observed; an unavailable provider has `available: false` |
+| `connection-error` | `{"code":"protocol_error","message":"Device rejected the operation","protocolCode":7}` |
+| `connection-close` | `{"intentional":false,"transport":"companion"}` |
+| `watch-close` | `{"reason":"signal","signal":"SIGINT","intentional":true}` |
+
+Playback states are `unknown`, `playing`, `paused`, `stopped`, `interrupted`, and
+`seeking`. Power and focus use the strings shown above. One-shot `error` records
+use the same safe data shape as `connection-error`; stable codes are
+`invalid_arguments`, `unsupported`, `credentials_unavailable`, `text_unfocused`,
+`protocol_error`, `transport_error`, `operation_failed`, `output_limit`, and
+`cancelled`. Signal cancellation additionally includes `signal`. Successful
+one-shots exit 0; failures, transport loss and output failure exit 1; SIGINT and
+SIGTERM exit 130 and 143. A dead output pipe cannot deliver a terminal JSON record,
+but still tears down the command and exits nonzero.
+
+
 
 Credentials, protocol settings, DMAP GUIDs and nonsecret endpoint hints use
 `~/.atv-storage.json`, the public versioned `FileStorage` format (plaintext, mode `0600`,
@@ -74,6 +147,8 @@ a nonempty IP literal; an IPv6 link-local address needs its interface scope (for
 not recursive DNS, so routing, firewalls, NAT, and client isolation can still prevent discovery.
 It is unauthenticated and does not establish reachability, wake/trust state, or device identity:
 pair normally and rely on cryptographic connection verification before trusting a result.
+The same host flags work with `atv --json scan --host <ip>`; cancellation releases
+both the ordinary browser and targeted UDP discovery.
 
 Control commands use the public `DeviceSession` operation policy, not a separate CLI router.
 Navigation/media/volume prefer eligible AirPlay MRP, enabled standalone MRP, then Companion

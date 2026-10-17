@@ -54,10 +54,25 @@ Hardware status: AirPlay 2 realtime audio, RAOP discovery and `wavPcm` are verif
 [tested models](https://github.com/energee/node-appletv-remote/blob/main/README.md#tested-on); legacy receivers
 and legacy PIN pairing are verified only against loopback tests. HomePods and other receivers needing transient pairing,
 AirPlay 2 buffered audio, RSA/FairPlay/MFi authentication, password digest auth,
-ALAC, multiroom, live sources, artwork,
-and progress are excluded. `atv raop-stream` wraps this API
+ALAC, multiroom, and live sources are excluded. `atv raop-stream` wraps this API
 for PIN-less legacy receivers (it supplies neither a `legacySeed` nor HAP credentials). Its CLI adapter can
 use an installed `ffmpeg` to decode finite files and HTTP(S) URLs; transcoding is not part of `RaopStream`.
+Local `.wav` inputs also provide embedded tags, JPEG artwork, and duration; raw PCM
+and remote inputs are never parsed for tags.
+
+`extractRaopMetadata(path, explicit?)` returns `{ metadata, duration? }` for finite local
+files using `music-metadata`. Explicit caller fields override extracted title, artist,
+album, and artwork. Embedded artwork must be a structurally declared JPEG no larger
+than 1 MiB; other or oversized covers are omitted, not converted or relabeled.
+Pass the result as `RaopStream.stream(source, options)` options. Receiver `md`
+capabilities gate text (`0`), artwork (`1`), and progress (`2`) before source ownership.
+Initial progress and JPEG artwork are sent after SETUP and before RECORD with the
+first RTP timestamp; text metadata is sent during active playback. Progress uses
+rounded 44.1 kHz frame counts and wraps at 32 bits. `setMetadata()` updates text
+and/or JPEG artwork during playback.
+
+On tvOS 26.6, text/artwork/progress requests were accepted without visible metadata
+display. Protocol acceptance is not proof that a receiver displays the supplied tags.
 
 `scan()` browses `_raop._tcp` and fills `raopAddress`, `raopPort` and `raopTxt` (see
 [Discovery](internals.md#discovery-and-transport-selection)). End to end, discovering a receiver and

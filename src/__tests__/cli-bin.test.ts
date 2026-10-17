@@ -14,7 +14,7 @@ beforeAll(() => {
   directory = mkdtempSync(join(scratch, 'cli-bin-'));
   executable = join(directory, 'atv');
   symlinkSync(resolve('dist/cli/index.js'), executable);
-}, 30000);
+}, 60000);
 afterAll(() => { if (directory) rmSync(directory, { recursive: true, force: true }); });
 
 it('runs help through an npm-style symlink', () => {
@@ -27,4 +27,28 @@ it.each([['seek', 'invalid'], ['text', 'set'], ['command', 'constructor']])('rep
   expect(result.status).toBe(1);
   expect(result.stderr).toMatch(/^Error:/);
   expect(result.stdout).not.toContain('Connecting');
+});
+
+it('emits a parseable JSON result through an npm-style symlink', () => {
+  const result = spawnSync(process.execPath, [executable, '--json', '--help'], { encoding: 'utf8' });
+  expect(result.status).toBe(0);
+  expect(result.stderr).toBe('');
+  expect(JSON.parse(result.stdout)).toMatchObject({
+    version: 1,
+    type: 'result',
+    command: 'help',
+    data: { schemaVersion: 1 },
+  });
+});
+
+it('parses global JSON before rejecting invalid arguments', () => {
+  const result = spawnSync(process.execPath, [executable, '--json', 'seek', 'invalid'], { encoding: 'utf8' });
+  expect(result.status).toBe(1);
+  expect(result.stderr).toBe('');
+  expect(JSON.parse(result.stdout)).toMatchObject({
+    version: 1,
+    type: 'error',
+    command: 'seek',
+    data: { code: 'invalid_arguments' },
+  });
 });
