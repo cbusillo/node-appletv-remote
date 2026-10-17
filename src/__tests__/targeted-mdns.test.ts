@@ -6,9 +6,9 @@ const sockets: dgram.Socket[] = [];
 afterEach(() => { for (const socket of sockets.splice(0)) socket.close(); });
 
 const name = (value: string) => Buffer.concat([...value.split('.').map(label => Buffer.concat([Buffer.from([label.length]), Buffer.from(label)])), Buffer.from([0])]);
-const rr = (owner: string, type: number, data: Buffer) => {
+const rr = (owner: string, type: number, data: Buffer, ttl = 120, flush = false) => {
   const header = Buffer.alloc(10);
-  header.writeUInt16BE(type, 0); header.writeUInt16BE(1, 2); header.writeUInt32BE(120, 4); header.writeUInt16BE(data.length, 8);
+  header.writeUInt16BE(type, 0); header.writeUInt16BE(1 | (flush ? 0x8000 : 0), 2); header.writeUInt32BE(ttl, 4); header.writeUInt16BE(data.length, 8);
   return Buffer.concat([name(owner), header, data]);
 };
 const packet = (...records: Buffer[]) => {
@@ -49,6 +49,14 @@ describe('targeted mDNS', () => {
       rr(instance, 16, Buffer.concat([Buffer.from([17]), Buffer.from('deviceid=11:22:33')])),
       rr(host, 1, Buffer.from([192, 0, 2, 44])),
     ))).toHaveLength(4);
+  });
+
+  it('retains TTL and cache-flush metadata while discarding unavailable root targets', () => {
+    const records = parsePacket(packet(
+      rr('_airplay._tcp.local', 12, Buffer.from([0]), 0),
+      rr('living-room.local', 1, Buffer.from([192, 0, 2, 44]), 30, true),
+    ));
+    expect(records).toEqual([expect.objectContaining({ type: 1, ttl: 30, flush: true, data: '192.0.2.44' })]);
   });
 
   it('follows PTR records to assemble SRV, TXT and A answers while suppressing duplicates', async () => {
