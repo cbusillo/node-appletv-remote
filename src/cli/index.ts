@@ -663,7 +663,18 @@ class JsonLineWriter {
         const { record } = this.queue.shift()!;
         try {
           if (!process.stdout.write(`${JSON.stringify(record)}\n`)) {
-            await new Promise<void>((resolve) => process.stdout.once('drain', resolve));
+            await new Promise<void>((resolve, reject) => {
+              const complete = () => {
+                process.stdout.removeListener('error', failed);
+                resolve();
+              };
+              const failed = (error: Error) => {
+                process.stdout.removeListener('drain', complete);
+                reject(error);
+              };
+              process.stdout.once('drain', complete);
+              process.stdout.once('error', failed);
+            });
           }
         } catch (error: unknown) {
           if ((error as NodeJS.ErrnoException).code === 'EPIPE') this.closed = true;
