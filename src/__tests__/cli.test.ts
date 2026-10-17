@@ -111,6 +111,30 @@ describe('CLI operations', () => {
     await expect(run(['stop'])).rejects.toThrow('send failed');
     expect(AppleTV.prototype.close).toHaveBeenCalledTimes(1);
   });
+  it('retains MRP key dispatch', async () => {
+    const send = vi.spyOn(AppleTV.prototype, 'sendKeyCommand').mockResolvedValue(undefined);
+    await run(['command', 'play']);
+    expect(send).toHaveBeenCalledWith('play', undefined);
+    expect(console.log).toHaveBeenCalledWith('Sent: play');
+    expect(AppleTV.prototype.close).toHaveBeenCalledTimes(1);
+  });
+  it('closes a failed MRP connection', async () => {
+    vi.mocked(AppleTV.prototype.connect).mockRejectedValue(new Error('connect failed'));
+    await expect(run(['stop'])).rejects.toThrow('connect failed');
+    expect(AppleTV.prototype.close).toHaveBeenCalledTimes(1);
+  });
+  it('closes a failed Companion connection', async () => {
+    vi.mocked(AppleTV.prototype.connectCompanion).mockRejectedValue(new Error('connect failed'));
+    await expect(run(['power'])).rejects.toThrow('connect failed');
+    expect(AppleTV.prototype.close).toHaveBeenCalledTimes(1);
+  });
+  it('passes repeated targeted scan hosts and rejects malformed values before scan I/O', async () => {
+    vi.mocked(scan).mockResolvedValue([]);
+    await run(['scan', '--host', '192.0.2.8', '--host', '2001:db8::8']);
+    expect(scan).toHaveBeenCalledWith({ timeout: 5000, hosts: ['192.0.2.8', '2001:db8::8'] });
+    await expect(run(['scan', '--host', 'not-an-ip'])).rejects.toThrow('Invalid discovery host');
+    expect(scan).toHaveBeenCalledTimes(1);
+  });
   it('shows help without a connection', async () => {
     await run(['--help']);
     expect(console.log).toHaveBeenCalledWith(expect.stringContaining('seek'));

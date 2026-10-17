@@ -12,6 +12,7 @@ const [device] = await scan({ timeout: 5000 });
 // await scan({ until: (d) => d.name === 'Living Room' });
 const atv = new AppleTV(device);
 
+
 // AirPlay pairing: a PIN appears on the TV
 const pairing = await atv.startPairing();
 const credentials = await pairing.finish(pin);
@@ -20,6 +21,23 @@ const credentials = await pairing.finish(pin);
 const companionPairing = await atv.startCompanionPairing();
 const companionCredentials = await companionPairing.finish(pin);
 ```
+When you already know an address, keep ordinary multicast browsing and query that host's mDNS
+endpoint directly:
+
+```typescript
+const devices = await scan({ hosts: ['192.0.2.20', 'fe80::1234%en0'], timeout: 5000 });
+```
+
+`hosts` accepts only nonempty IP literals. IPv6 link-local literals require an interface scope
+such as `%en0`; scoped addresses are preserved. Targeted discovery sends DNS-SD mDNS questions
+to UDP port 5353, including the QU bit, and also accepts valid multicast-style replies. It does
+not use recursive DNS, bypass routing/firewall/NAT/client-isolation limits, or prove that a
+device is reachable, awake, or trusted. Discovery records are unauthenticated: complete normal
+pairing and cryptographic connection verification before trusting a result.
+
+Targeted discovery closes its UDP sockets and retry timer with the scan. Closing
+during asynchronous socket setup cannot restart querying or leave a retry timer alive.
+
 ## Optional storage
 
 Storage is opt-in: existing explicit credentials never cause filesystem access. Call

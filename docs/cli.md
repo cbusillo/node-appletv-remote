@@ -3,7 +3,7 @@
 Every `atv` command, its arguments, and how it picks a device. `atv --help` prints the same syntax.
 
 ```bash
-atv scan                          # find Apple TVs (and AirPlay receivers' psi output IDs)
+atv scan [--host <ip>]...           # also query each known host's mDNS endpoint directly
 atv pair                          # AirPlay pairing (enter the PIN shown on the TV)
 atv companion-pair                # Companion pairing, needed for Companion-only controls/apps/accounts/power
 
@@ -140,6 +140,15 @@ case-insensitively, and blank, missing or ambiguous selectors reject.
 Stored endpoint overrides take precedence over discovery hints. Connections try validated
 cached hints first and rescan only after setup failure, before any action is sent.
 Discovery matches known aliases exactly, never by a friendly-name substring.
+
+`atv scan --host <ip>` is repeatable and retains ordinary multicast browsing. Each value must be
+a nonempty IP literal; an IPv6 link-local address needs its interface scope (for example,
+`fe80::1234%en0`) and is preserved. Targeted scan sends DNS-SD mDNS packets to UDP port 5353,
+not recursive DNS, so routing, firewalls, NAT, and client isolation can still prevent discovery.
+It is unauthenticated and does not establish reachability, wake/trust state, or device identity:
+pair normally and rely on cryptographic connection verification before trusting a result.
+The same host flags work with `atv --json scan --host <ip>`; cancellation releases
+both the ordinary browser and targeted UDP discovery.
 
 Control commands use the public `DeviceSession` operation policy, not a separate CLI router.
 Navigation/media/volume prefer eligible AirPlay MRP, enabled standalone MRP, then Companion

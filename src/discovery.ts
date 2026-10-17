@@ -6,6 +6,8 @@
  */
 
 import { Bonjour, type Service } from 'bonjour-service';
+import { parseTargets, TargetedMdns } from './targeted-mdns.js';
+import type { TargetedService } from './targeted-mdns.js';
 import { isIP } from 'node:net';
 
 /** Fields this library reads from an `_airplay._tcp` TXT record. */
@@ -126,6 +128,8 @@ export class DiscoveredDevice {
 export interface ScanOptions {
   /** How long to browse, in ms; default 5000. */
   timeout?: number;
+  /** Explicit IP literals to query at their mDNS endpoint as well as normal multicast browsing. */
+  hosts?: string[];
   /** Cancel browsing and release every browser/socket before rejecting. */
   signal?: AbortSignal;
   /** Keep only devices for which this returns true. */
@@ -144,22 +148,33 @@ function parseRaopName(instance: string | undefined): { mac: string; name: strin
 }
 
 /** Usable unicast addresses, preferring IPv4 for compatibility; scoped IPv6 is preserved. */
-function usableAddresses(service: Service): string[] {
-  return (service.addresses ?? []).filter((address) => {
-    const family = isIP(address);
-    if (family === 4) return !/^(169\.254\.|127\.|0\.|22[4-9]\.|23\d\.)/.test(address);
-    if (family !== 6) return false;
-    const ip = address.split('%')[0].toLowerCase();
-    return ip !== '::' && ip !== '::1' && !ip.startsWith('ff') &&
-      (!/^fe[89ab]/.test(ip) || address.includes('%'));
-  }).sort((a, b) => (isIP(a) === 4 ? 0 : 1) - (isIP(b) === 4 ? 0 : 1));
+type DiscoveryService = {
+  addresses?: string[];
+  port?: number;
+  txt?: Record<string, unknown>;
+  host?: string;
+  name?: string;
+  fqdn?: string;
+};
+
+function usableAddresses(service: DiscoveryService): string[] {
+  return (service.addresses ?? []).map(address => ({ address, family: isIP(address.split('%', 1)[0]) }))
+    .filter(({ address, family }) => {
+      if (family === 4) return !/^(169\.254\.|127\.|0\.|22[4-9]\.|23\d\.)/.test(address);
+      if (family !== 6) return false;
+      const ip = address.split('%', 1)[0].toLowerCase();
+      return ip !== '::' && ip !== '::1' && !ip.startsWith('ff') &&
+        (!/^fe[89ab]/.test(ip) || address.includes('%'));
+    }).sort((a, b) => (a.family === 4 ? 0 : 1) - (b.family === 4 ? 0 : 1))
+    .map(({ address }) => address);
 }
 
 /** Browse unauthenticated services; ambiguous associations stay separate. Callback errors stop all browsers. */
 export async function scan(options: ScanOptions = {}): Promise<DiscoveredDevice[]> {
+  const targets = parseTargets(options.hosts ?? []);
   options.signal?.throwIfAborted();
   type RecordEntry = {
-    type: string; service: Service; addresses: string[]; txt: Record<string, string>;
+    type: string; service: DiscoveryService; addresses: string[]; txt: Record<string, string>;
     ids: string[]; identity: { mac?: string; mrp?: string; dmap?: string };
   };
   const records: RecordEntry[] = [];
@@ -169,22 +184,20 @@ export async function scan(options: ScanOptions = {}): Promise<DiscoveredDevice[
     let timer: ReturnType<typeof setTimeout> | undefined;
     let untilQueued = false;
     const browsers: ReturnType<Bonjour['find']>[] = [];
+    let targeted: TargetedMdns | undefined;
 
     const collect = (): DiscoveredDevice[] => {
       const groups: RecordEntry[][] = [];
       const priority = ['airplay', 'raop', 'mediaremotetv', 'companion-link', 'touch-able', 'appletv-v2'];
-      // Establish primary devices first, independent of callback arrival order.
       const ordered = records.map(record => ({
         record, priority: priority.indexOf(record.type),
         key: JSON.stringify([record.ids, record.service.host, record.service.name, record.addresses, record.service.port]),
       })).sort((a, b) => a.priority - b.priority || a.key.localeCompare(b.key)).map(({ record }) => record);
       for (const record of ordered) {
         const matching = groups.filter((group) => {
-          // A copied identity cannot join disjoint endpoints for the same protocol.
           if (group.some(other => other.type === record.type && other.service.host && record.service.host &&
             other.service.host.toLowerCase() !== record.service.host.toLowerCase() &&
             !record.addresses.some(address => other.addresses.includes(address)))) return false;
-          // Host/address matches stay anchored; compatible modern identity aliases may span protocols.
           const anchors = group.filter(other => other.type === group[0].type);
           if (record.identity.dmap || group[0].identity.dmap) {
             return anchors.some(other => record.addresses.some(address => other.addresses.includes(address)));
@@ -197,7 +210,6 @@ export async function scan(options: ScanOptions = {}): Promise<DiscoveredDevice[
             (record.service.host && record.service.host.toLowerCase() === other.service.host?.toLowerCase()) ||
             record.addresses.some(address => other.addresses.includes(address)));
         });
-        // Never use a bridging advertisement to merge devices or pick one arbitrarily.
         if (matching.length === 1) matching[0].push(record);
         else groups.push([record]);
       }
@@ -212,7 +224,6 @@ export async function scan(options: ScanOptions = {}): Promise<DiscoveredDevice[
           record.service.host?.toLowerCase() === primary.service.host?.toLowerCase()).flatMap(record => record.addresses);
         const sharedAddress = (record: RecordEntry | undefined): string | undefined =>
           record?.addresses.find(address => primaryAddresses.includes(address)) ?? record?.addresses[0];
-        // Never fall back to an unrelated DMAP address under a modern device identity.
         const dmapAddress = dmap?.addresses.find(address => primaryAddresses.includes(address));
         const identifiers = [...new Set([airplay, mrp, dmap, companion, raop].flatMap((r) => r?.ids ?? []))];
         const build = Number(mrp?.txt.systembuildversion?.match(/^(\d+)[A-Z]/)?.[1]);
@@ -236,6 +247,7 @@ export async function scan(options: ScanOptions = {}): Promise<DiscoveredDevice[
     const cleanup = (): void => {
       done = true;
       clearTimeout(timer);
+      targeted?.close();
       options.signal?.removeEventListener('abort', abort);
       for (const browser of browsers) browser.stop();
       instance.destroy();
@@ -251,37 +263,45 @@ export async function scan(options: ScanOptions = {}): Promise<DiscoveredDevice[
     const abort = () => fail(options.signal?.reason ?? new Error('Discovery cancelled'));
     options.signal?.addEventListener('abort', abort, { once: true });
     if (options.signal?.aborted) { abort(); return; }
-    for (const type of ['airplay', 'raop', 'companion-link', 'mediaremotetv', 'touch-able', 'appletv-v2']) {
-      browsers.push(instance.find({ type, protocol: 'tcp' }, (service: Service) => {
+    const scheduleUntil = (): void => {
+      if (!options.until || untilQueued) return;
+      untilQueued = true;
+      queueMicrotask(() => {
+        untilQueued = false;
         if (done) return;
-        const addresses = usableAddresses(service);
-        if (!addresses.length || !service.port) return;
-        const txt = normalizeTxt(service.txt);
-        if (type === 'companion-link' && txt.rpmd && !txt.rpmd.startsWith('AppleTV')) return;
-        const legacy = type === 'touch-able' || type === 'appletv-v2';
-        const raopName = type === 'raop' ? parseRaopName(service.name) : undefined;
-        if (type === 'raop' && !raopName) return;
-        const ids = (type === 'airplay' ? [txt.deviceid] : type === 'raop' ? [raopName!.mac] : type === 'companion-link' ? [txt.rpmrtid] : type === 'mediaremotetv' ? [txt.uniqueidentifier, txt.macaddress] : [service.name ? `dmap:${service.name}` : undefined]).filter((id): id is string => !!id);
-        // Only documented cross-protocol identifiers share a namespace. DMAP instance names do not.
-        // MACs compare case- and colon-insensitively (RAOP instance names omit the colons).
-        const identity = {
-          mac: (type === 'airplay' ? txt.deviceid : type === 'raop' ? raopName!.mac :
-            type === 'mediaremotetv' ? txt.macaddress : undefined)?.toLowerCase().replaceAll(':', ''),
-          mrp: (type === 'companion-link' ? txt.rpmrtid : type === 'mediaremotetv' ? txt.uniqueidentifier : undefined)?.toLowerCase(),
-          dmap: legacy ? (service.name || service.fqdn || 'unknown').toLowerCase() : undefined,
-        };
-        records.push({ type, service, addresses, txt, ids, identity });
-        // Regrouping is order-independent and O(n log n); evaluate once per burst, not per record.
-        if (options.until && !untilQueued) {
-          untilQueued = true;
-          queueMicrotask(() => {
-            untilQueued = false;
-            if (done) return;
-            try { if (collect().some(options.until!)) finish(); }
-            catch (error) { fail(error); }
-          });
-        }
-      }));
+        try { if (collect().some(options.until!)) finish(); }
+        catch (error) { fail(error); }
+      });
+    };
+    const add = (type: string, service: DiscoveryService): void => {
+      if (done) return;
+      const addresses = usableAddresses(service);
+      if (!addresses.length || !service.port) return;
+      const txt = normalizeTxt(service.txt);
+      if (type === 'companion-link' && txt.rpmd && !txt.rpmd.startsWith('AppleTV')) return;
+      const legacy = type === 'touch-able' || type === 'appletv-v2';
+      const raopName = type === 'raop' ? parseRaopName(service.name) : undefined;
+      if (type === 'raop' && !raopName) return;
+      const ids = (type === 'airplay' ? [txt.deviceid] : type === 'raop' ? [raopName!.mac] : type === 'companion-link' ? [txt.rpmrtid] : type === 'mediaremotetv' ? [txt.uniqueidentifier, txt.macaddress] : [service.name ? `dmap:${service.name}` : undefined]).filter((id): id is string => !!id);
+      const identity = {
+        mac: (type === 'airplay' ? txt.deviceid : type === 'raop' ? raopName!.mac :
+          type === 'mediaremotetv' ? txt.macaddress : undefined)?.toLowerCase().replaceAll(':', ''),
+        mrp: (type === 'companion-link' ? txt.rpmrtid : type === 'mediaremotetv' ? txt.uniqueidentifier : undefined)?.toLowerCase(),
+        dmap: legacy ? (service.name || service.fqdn || 'unknown').toLowerCase() : undefined,
+      };
+      const duplicate = records.some(record => record.type === type && record.service.host === service.host &&
+        record.service.name === service.name && record.service.port === service.port &&
+        record.addresses.length === addresses.length && record.addresses.every(address => addresses.includes(address)) &&
+        JSON.stringify(record.txt) === JSON.stringify(txt));
+      if (!duplicate) records.push({ type, service, addresses, txt, ids, identity });
+      scheduleUntil();
+    };
+    for (const type of ['airplay', 'raop', 'companion-link', 'mediaremotetv', 'touch-able', 'appletv-v2']) {
+      browsers.push(instance.find({ type, protocol: 'tcp' }, (service: Service) => add(type, service)));
+    }
+    if (targets.length) {
+      targeted = new TargetedMdns(targets, (service: TargetedService) => add(service.type, service), error => fail(error));
+      targeted.start().catch(fail);
     }
     timer = setTimeout(finish, options.timeout ?? 5000);
   });

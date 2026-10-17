@@ -48,6 +48,13 @@ describe('Discovery', () => {
     expect(device.address).toBe('192.168.1.100');
     expect(device.port).toBe(7000);
   });
+
+  it('retains scoped IPv6 addresses from targeted discovery', async () => {
+    bonjour.services = {
+      airplay: [{ name: 'Living Room', host: 'tv.local', addresses: ['fe80::1234%en0'], port: 7000, txt: { deviceid: 'AA:BB:CC:DD:EE:FF' } }],
+    };
+    expect(await scanned()).toMatchObject([{ address: 'fe80::1234%en0', port: 7000 }]);
+  });
 });
 
 describe('_raop._tcp discovery', () => {

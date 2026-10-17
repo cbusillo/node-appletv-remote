@@ -6,6 +6,7 @@
  * public versioned FileStorage API; legacy CLI JSON is imported once without deletion.
  */
 import { scan, normalizeTxt, type DiscoveredDeviceInfo } from '../discovery.js';
+import { parseTargets } from '../targeted-mdns.js';
 import { setTimeout as delay } from 'node:timers/promises';
 import { AppleTV, Key, ShuffleState, RepeatState, contentItems, INPUT_ACTIONS } from '../appletv.js';
 import { PlaybackState } from '../now-playing-info.js';
@@ -16,6 +17,7 @@ import { DeviceSession, KEY_OPERATIONS, supportsSessionOperation } from '../sess
 import type { ControlProtocol, SessionOperation, SessionCredentials } from '../session.js';
 import { DmapPairing } from '../dmap/pairing.js';
 import { RaopStream } from '../raop/stream.js';
+import { extractRaopMetadata } from '../raop/metadata.js';
 import { openRaopInput, type RaopInput } from './raop-input.js';
 import { Bonjour, type Service } from 'bonjour-service';
 import { readFileSync, writeFileSync, existsSync, realpathSync } from 'node:fs';
@@ -111,12 +113,11 @@ async function selectDevice<T>(devices: T[], none: string, label: (device: T) =>
 function deviceAliases(device: DiscoveredDeviceInfo): string[] {
   return [...new Map([device.deviceId, ...(device.identifiers ?? [])].map(alias => [alias.toLowerCase(), alias])).values()];
 }
- 
 
 /** `atv scan`: list Apple TVs and AirPlay receivers found via mDNS within 5 s, with each `psi` output ID. */
-async function cmdScan() {
+async function cmdScan(hosts: string[]) {
   console.log('Scanning for Apple TVs...');
-  const devices = await scan({ timeout: 5000 });
+  const devices = await scan({ timeout: 5000, hosts });
   if (devices.length === 0) {
     console.log('No Apple TVs found.');
     return;
@@ -124,6 +125,17 @@ async function cmdScan() {
   devices.forEach((d, i) => {
     console.log(`  ${i + 1}. ${d.name} (${d.address}:${d.port}) [${d.model}]${d.airplayPsi ? ` psi=${d.airplayPsi}` : ''}`);
   });
+}
+
+/** Shared human/JSON targeted scan validation, before discovery opens sockets. */
+function scanHosts(args: string[]): string[] {
+  const hosts: string[] = [];
+  for (let index = 0; index < args.length; index += 2) {
+    if (args[index] !== '--host' || args[index + 1] === undefined) throw new Error('Usage: atv scan [--host <ip>]...');
+    hosts.push(args[index + 1]);
+  }
+  parseTargets(hosts);
+  return hosts;
 }
 
 /** `atv pair`: persist credentials under the carrier actually selected by discovery. */
@@ -597,11 +609,14 @@ function findRaopService(address: string, signal?: AbortSignal): Promise<{ port:
 
 /**
  * `atv raop-stream <ipv4> <file-or-url>` (experimental): adapt finite audio to PCM16LE stereo
- * 44.1 kHz before streaming it to a legacy RAOP receiver. Ctrl+C tears both source and RAOP down.
+ * 44.1 kHz before streaming it to a legacy RAOP receiver. Local WAV files also provide embedded
+ * tags, artwork, and duration. Ctrl+C tears both source and RAOP down.
  */
 async function cmdRaopStream(address: string, input: string) {
   const remote = /^https?:\/\//i.test(input) || /^pcm:https?:\/\//i.test(input);
   if (!remote && !existsSync(input)) throw new Error(`No such file: ${input}`);
+  const extracted = !remote && input.toLowerCase().endsWith('.wav') ? await extractRaopMetadata(input) : undefined;
+  const metadata = extracted && Object.keys(extracted.metadata).length ? extracted.metadata : undefined;
   const cancellation = new AbortController();
   const cancel = () => cancellation.abort(new Error('RAOP aborted'));
   process.once('SIGINT', cancel);
@@ -616,7 +631,11 @@ async function cmdRaopStream(address: string, input: string) {
       : await discovery;
     const sender = new RaopStream(address, port, txt);
     console.error(`Streaming ${input} to ${address}:${port} (Ctrl+C to stop)...`);
-    await sender.stream(source.source, { signal: cancellation.signal });
+    await sender.stream(source.source, {
+      signal: cancellation.signal,
+      ...(metadata === undefined ? {} : { metadata }),
+      ...(extracted?.duration === undefined ? {} : { duration: extracted.duration }),
+    });
     console.log('Stream complete.');
   } finally {
     source?.close();
@@ -627,7 +646,8 @@ async function cmdRaopStream(address: string, input: string) {
 /** Print the CLI syntax; no discovery or credential loading occurs. */
 function help(): void {
   console.log(`Usage:
-  atv scan | pair | companion-pair
+  atv scan [--host <ip>]...         # find Apple TVs; query known mDNS hosts directly too
+  atv pair | companion-pair
   atv command <key> [action] [device]  Send a routed key or Companion button (alias: cmd);
                                        action: singleTap (default), doubleTap, hold
                                        (case-insensitive)
@@ -1006,8 +1026,8 @@ async function mainJson(argv: string[]): Promise<void> {
     process.once('SIGINT', interrupt);
     process.once('SIGTERM', terminate);
     if (command === 'scan') {
-      argumentsFor(args, 0, 'scan');
-      const devices = await scan({ timeout: 5000, signal: controller.signal });
+      const hosts = scanHosts(args);
+      const devices = await scan({ timeout: 5000, hosts, signal: controller.signal });
       if (!cancelled) writer.write(jsonRecord('result', 'scan', { devices: devices.map(device => ({
         id: device.deviceId, name: device.name, address: device.address, port: device.port, model: device.model, psi: device.airplayPsi ?? null,
       })) }));
@@ -1196,10 +1216,11 @@ export async function main(argv: string[], jsonInternal = false, context?: JsonO
       } else throw new Error(`Invalid ${cmd} operation: ${action ?? '(missing)'}`);
       break;
     }
-    case 'scan': case 'pair': case 'companion-pair':
+    case 'scan': return cmdScan(scanHosts(args));
+    case 'pair': case 'companion-pair':
       if (args.length) throw new Error(`Usage: atv ${cmd}`);
       if (jsonInternal) throw new Error(`Unsupported in JSON mode: ${cmd}`);
-      return cmd === 'scan' ? cmdScan() : cmd === 'pair' ? cmdPair() : cmdCompanionPair();
+      return cmd === 'pair' ? cmdPair() : cmdCompanionPair();
     case 'remote': case 'state': case 'queue': case 'messages': case 'keyboard': case 'companion-test':
       argumentsFor(args, 0, `${cmd} [device]`);
       if (cmd === 'state') {
