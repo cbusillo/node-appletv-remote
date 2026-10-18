@@ -44,6 +44,10 @@ export class CompanionPairSetup {
   constructor(
     private host: string,
     private port: number,
+    private options: {
+      /** Label the Apple TV lists for this pairing under Remote App and Devices. */
+      name?: string;
+    } = {},
   ) {
     this.clientId = randomUUID();
 
@@ -208,6 +212,7 @@ export class CompanionPairSetup {
       [TlvTag.Identifier]: clientIdBuf,
       [TlvTag.PublicKey]: this.edPublicKeyRaw,
       [TlvTag.Signature]: signature,
+      ...(this.options.name ? { [TlvTag.Name]: opackEncode(new Map<OpackValue, OpackValue>([['name', this.options.name]])) } : {}),
     });
 
     const nonce = Buffer.alloc(12, 0);
