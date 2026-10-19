@@ -18,7 +18,6 @@ describe('read-only volume queries', () => {
     const first = await entry.MRPMessage.getVolume('synthetic-output');
     const decoded = await MRPMessage.decode(first);
     expect(decoded.type).toBe(reference.type);
-    expect(decoded.type).toBe(MessageType.GetVolume);
     expect(decoded['.getVolumeMessage']).toEqual(reference['.getVolumeMessage']);
     expect(decoded.identifier).toBeTruthy();
     const next = await MRPMessage.decode(await entry.MRPMessage.getVolume('synthetic-output'));

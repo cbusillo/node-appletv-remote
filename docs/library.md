@@ -227,6 +227,25 @@ under its control over CEC or IR; not confirmed), and another reports relative o
 unsupported). Both answer a GetVolume request with 0 for every output UID, and their
 UpdateOutputDevice descriptors carry no volume.
 
+### Low-level volume queries
+
+For an already connected `AirPlayConnection`, the package entry exports the low-level
+`MRPMessage` builders and `MessageType` discriminators:
+
+```typescript
+import { MRPMessage, MessageType } from 'node-appletv-remote';
+
+const request = await MRPMessage.getVolume(outputDeviceUID);
+const reply = await connection.sendMRPMessageAndWait(request, MessageType.GetVolumeResult);
+const result = reply['.getVolumeResultMessage'] as { volume?: number } | undefined;
+const volume = result?.volume;
+```
+
+The caller selects the output UID and owns the connection. This reads a level without
+changing it; an absent volume remains `undefined`, distinct from a reported zero.
+It does not add an automatic startup query or a high-level `AppleTV` method. A zero
+reply alone does not establish that the output supports absolute volume control.
+
 **Idle Apple TV state (#10):** when no app has a loaded item, an Apple TV (seen on
 both tested models) answers the queue request with a typeless
 reply carrying our identifier and `errorCode` 35 ("Could not find the specified now
