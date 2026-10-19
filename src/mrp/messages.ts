@@ -55,6 +55,8 @@ export enum MessageType {
   SetNowPlayingClient = 46,
   SetNowPlayingPlayer = 47,
   ModifyOutputContextRequest = 48,
+  GetVolume = 49,
+  GetVolumeResult = 50,
   SetVolume = 51,
   VolumeDidChange = 52,
   RemoveClient = 53,
@@ -160,6 +162,16 @@ async function encodeMessage(
 
 /** Static builders that return encoded ProtocolMessage buffers ready to frame and send, plus `decode` for incoming ones. */
 export class MRPMessage {
+  /** Read the current level for one output without changing its volume. */
+  static async getVolume(outputDeviceUID: string): Promise<Buffer> {
+    if (!outputDeviceUID) throw new TypeError('An output device identifier is required');
+    return encodeMessage(MessageType.GetVolume, {
+      key: '.getVolumeMessage',
+      typeName: 'GetVolumeMessage',
+      fields: { outputDeviceUID },
+    });
+  }
+
   /** Shared audio routing uses discriminator 48, extension 52; paired fields support cluster-aware receivers. */
   static async modifyOutputDevices(mode: 'add' | 'remove' | 'set', devices: string[]): Promise<Buffer> {
     const field = { add: 'addingDevices', remove: 'removingDevices', set: 'settingDevices' }[mode];

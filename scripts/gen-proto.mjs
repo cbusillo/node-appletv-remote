@@ -47,6 +47,8 @@ const PROTO_FILES = [
   'SendHIDEventMessage.proto',
   'ModifyOutputContextRequestMessage.proto',
   'SetVolumeMessage.proto',
+  'GetVolumeMessage.proto',
+  'GetVolumeResultMessage.proto',
   'VolumeDidChangeMessage.proto',
   'GetVolumeControlCapabilitiesResultMessage.proto',
   'VolumeControlCapabilitiesDidChangeMessage.proto',
