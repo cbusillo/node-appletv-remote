@@ -241,8 +241,12 @@ const result = reply['.getVolumeResultMessage'] as { volume?: number } | undefin
 const volume = result?.volume;
 ```
 
-The caller selects the output UID and owns the connection. This reads a level without
-changing it; an absent volume remains `undefined`, distinct from a reported zero.
+The caller selects the output UID and owns the connection. For the Apple TV's current
+output, take `clusterID || deviceUID` from its DeviceInfo message using an `mrp-message`
+listener attached before `connect()`. This identifies the device's output context, not the
+selected speaker's name. The request rejects on timeout or a protocol error reply. This
+reads a level without changing it; an absent volume remains `undefined`, distinct from a
+reported zero.
 It does not add an automatic startup query or a high-level `AppleTV` method. A zero
 reply alone does not establish that the output supports absolute volume control.
 
