@@ -1241,26 +1241,29 @@ export class AppleTV extends EventEmitter {
   }
 
   /**
-   * Ask once per MRP session for the starting absolute volume, since VolumeDidChange arrives only
-   * on a change. Needs the output UID and absolute capability; a VolumeDidChange always wins, and
-   * a timeout, error reply, or out-of-range reply leaves `volume` unset.
+   * Ask for the starting absolute volume, since VolumeDidChange arrives only on a change. Needs
+   * `setVolume` support (absolute capability and the output UID); a VolumeDidChange always wins.
+   * 0 is not a reading: tvOS answers 0 for any unknown UID and once did while AirPods attached.
+   * A timeout, error, zero or out-of-range reply leaves `volume` unset and the next MRP message
+   * (normally a capability update) asks again.
    */
   private requestMRPVolume(): void {
     const connection = this.connection;
     const uid = this.outputDeviceUID;
-    const capabilities = this.volumeAvailability?.volumeCapabilities;
     if (this.mrpVolumeRequested || !connection || !this.readyTransports.has(connection) || !uid) return;
-    if (this.mrpVolume !== undefined || (capabilities !== 2 && capabilities !== 3)) return;
+    if (this.mrpVolume !== undefined || this.featureAvailability('setVolume') !== 'supported') return;
     this.mrpVolumeRequested = true;
     void (async () => {
       const reply = await connection.sendMRPMessageAndWait(await MRPMessage.getVolume(uid), MessageType.GetVolumeResult);
       const volume = (reply['.getVolumeResultMessage'] as { volume?: unknown } | undefined)?.volume;
       if (this.connection !== connection || this.outputDeviceUID !== uid || this.mrpVolume !== undefined) return;
-      if (!(typeof volume === 'number' && Number.isFinite(volume) && volume >= 0 && volume <= 1)) return;
+      if (!(typeof volume === 'number' && Number.isFinite(volume) && volume > 0 && volume <= 1)) return;
       this.mrpVolume = Math.round(volume * 1000) / 10;
       this.volume = this.mrpVolume;
       this.emit('volume', this.volume);
-    })().catch(() => {});
+    })().catch(() => {}).finally(() => {
+      if (this.connection === connection && this.mrpVolume === undefined) this.mrpVolumeRequested = false;
+    });
   }
 
   /** Discard MRP runtime evidence when its transport session ends. */

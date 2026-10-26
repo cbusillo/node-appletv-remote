@@ -1,4 +1,5 @@
-// Type 50: reply to GetVolume (type 49); an absent volume stays distinct from 0.
+// Type 50: reply to GetVolume (type 49), volume 0..1. tvOS 26.6 answers 0 for any output UID,
+// even an unknown one, unless the output has absolute volume; an absent volume stays distinct from 0.
 syntax = "proto2";
 
 import "ProtocolMessage.proto";

@@ -332,4 +332,21 @@ describe('starting MRP volume', () => {
     expect(requests).toEqual([]);
     await tv.close();
   });
+
+  // tvOS 26.6 answered 0 once with AirPods attaching and absolute volume reported (0.75 later),
+  // and answers 0 for any unknown output UID, so 0 is not a reading.
+  it.each([
+    ['a zero reply', (conn: AirPlayConnection, identifier: string) =>
+      push(conn, { type: MessageType.GetVolumeResult, identifier, '.getVolumeResultMessage': { volume: 0 } })],
+    ['no reply', async () => {}],
+  ])('asks again on the next capability update after %s', async (_case, answer) => {
+    vi.useFakeTimers();
+    const { tv, requests, conn } = await connected(3, answer);
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(tv.volume).toBeUndefined();
+    await push(conn, { type: MessageType.VolumeControlAvailability, '.volumeControlAvailabilityMessage': { volumeControlAvailable: true, volumeCapabilities: 3 } });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(requests).toHaveLength(2);
+    await tv.close();
+  });
 });
