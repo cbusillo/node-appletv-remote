@@ -988,6 +988,36 @@ export const MRP_SCHEMA: Record<string, unknown> = {
         }
       }
     },
+    "getVolumeMessage": {
+      "edition": "proto2",
+      "type": "GetVolumeMessage",
+      "id": 53,
+      "extend": "ProtocolMessage"
+    },
+    "GetVolumeMessage": {
+      "edition": "proto2",
+      "fields": {
+        "outputDeviceUID": {
+          "type": "string",
+          "id": 1
+        }
+      }
+    },
+    "getVolumeResultMessage": {
+      "edition": "proto2",
+      "type": "GetVolumeResultMessage",
+      "id": 54,
+      "extend": "ProtocolMessage"
+    },
+    "GetVolumeResultMessage": {
+      "edition": "proto2",
+      "fields": {
+        "volume": {
+          "type": "float",
+          "id": 1
+        }
+      }
+    },
     "keyboardMessage": {
       "edition": "proto2",
       "type": "KeyboardMessage",
@@ -1550,6 +1580,8 @@ export const MRP_SCHEMA: Record<string, unknown> = {
             "SET_NOW_PLAYING_CLIENT_MESSAGE": 46,
             "SET_NOW_PLAYING_PLAYER_MESSAGE": 47,
             "MODIFY_OUTPUT_CONTEXT_REQUEST_MESSAGE": 48,
+            "GET_VOLUME_MESSAGE": 49,
+            "GET_VOLUME_RESULT_MESSAGE": 50,
             "SET_VOLUME_MESSAGE": 51,
             "VOLUME_DID_CHANGE_MESSAGE": 52,
             "REMOVE_CLIENT_MESSAGE": 53,

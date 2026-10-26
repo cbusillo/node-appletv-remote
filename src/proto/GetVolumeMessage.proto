@@ -1,0 +1,12 @@
+// Type 49: asks for the current absolute volume (0..1) of one output device.
+syntax = "proto2";
+
+import "ProtocolMessage.proto";
+
+extend ProtocolMessage {
+  optional GetVolumeMessage getVolumeMessage = 53;
+}
+
+message GetVolumeMessage {
+  optional string outputDeviceUID = 1;
+}

@@ -2,6 +2,8 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import protobuf from 'protobufjs';
 import { AirPlayConnection } from '../connection.js';
+import { AppleTV } from '../appletv.js';
+import { Credentials } from '../credentials.js';
 import { MRPMessage, MessageType } from '../mrp/messages.js';
 import { MRP_SCHEMA } from '../mrp/schema.js';
 
@@ -257,4 +259,94 @@ it('rejects identifierless application requests before creating response timers'
   await expect(conn.sendMRPMessageAndWait(request, MessageType.SetState)).rejects.toThrow(/identifier/i);
   expect(vi.getTimerCount()).toBe(0);
   conn.close();
+});
+
+describe('starting MRP volume', () => {
+  const push = (conn: AirPlayConnection, fields: Record<string, unknown>) =>
+    (conn as any).handleMRPResponse(Buffer.from(protocol.encode(protocol.fromObject(fields)).finish()));
+  const changed = (volume: number) => ({ type: MessageType.VolumeDidChange, '.volumeDidChangeMessage': { outputDeviceUID: 'dev', volume } });
+  /** Connect with DeviceInfo and capabilities from setup; `answer` receives each GetVolume request. */
+  async function connected(capabilities: number, answer: (conn: AirPlayConnection, identifier: string) => Promise<void> = async () => {}) {
+    const tv = new AppleTV({ name: 'offline', address: 'offline', port: 7000, deviceId: 'test', model: 'test' });
+    const requests: unknown[] = [];
+    vi.spyOn(AirPlayConnection.prototype, 'connect').mockImplementation(async function (this: AirPlayConnection) {
+      await push(this, { type: MessageType.DeviceInfo, '.deviceInfoMessage': { deviceUID: 'dev' } });
+      await push(this, { type: MessageType.VolumeControlAvailability, '.volumeControlAvailabilityMessage': { volumeControlAvailable: true, volumeCapabilities: capabilities } });
+    });
+    vi.spyOn(AirPlayConnection.prototype, 'sendMRPMessage').mockImplementation(async function (this: AirPlayConnection, bytes: Buffer) {
+      const request = await MRPMessage.decode(bytes);
+      if (request.type !== MessageType.GetVolume) return;
+      requests.push(request['.getVolumeMessage']);
+      await answer(this, request.identifier as string);
+    });
+    const events: number[] = [];
+    tv.on('volume', level => events.push(level));
+    await tv.connect(new Credentials(credentials));
+    await vi.advanceTimersByTimeAsync(0);
+    return { tv, requests, events, conn: (tv as any).connection as AirPlayConnection };
+  }
+  afterEach(() => vi.restoreAllMocks());
+
+  it('fills volume from the GetVolume reply right after connecting', async () => {
+    vi.useFakeTimers();
+    const { tv, requests, events } = await connected(2, (conn, identifier) =>
+      push(conn, { type: MessageType.GetVolumeResult, identifier, '.getVolumeResultMessage': { volume: 0.375 } }));
+    expect(requests).toEqual([{ outputDeviceUID: 'dev' }]);
+    expect(tv.volume).toBe(37.5);
+    expect(events).toEqual([37.5]);
+    await tv.close();
+  });
+
+  it.each([
+    ['an error reply', (conn: AirPlayConnection, identifier: string) => push(conn, { identifier, errorCode: 1 })],
+    ['an out-of-range reply', (conn: AirPlayConnection, identifier: string) =>
+      push(conn, { type: MessageType.GetVolumeResult, identifier, '.getVolumeResultMessage': { volume: 1.5 } })],
+    ['no reply', async () => {}],
+  ])('leaves volume undefined after %s', async (_case, answer) => {
+    vi.useFakeTimers();
+    const { tv, requests, events } = await connected(3, answer);
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(requests).toHaveLength(1);
+    expect(tv.volume).toBeUndefined();
+    expect(events).toEqual([]);
+    await tv.close();
+  });
+
+  it('keeps a VolumeDidChange that arrives before the reply', async () => {
+    vi.useFakeTimers();
+    let pending: (() => Promise<void>) | undefined;
+    const { tv, conn, events } = await connected(2, async (conn, identifier) => {
+      pending = () => push(conn, { type: MessageType.GetVolumeResult, identifier, '.getVolumeResultMessage': { volume: 0.9 } });
+    });
+    await push(conn, changed(0.25));
+    await pending!();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(tv.volume).toBe(25);
+    expect(events).toEqual([25]);
+    await tv.close();
+  });
+
+  it('does not ask an output without absolute volume', async () => {
+    vi.useFakeTimers();
+    const { tv, requests } = await connected(1);
+    expect(requests).toEqual([]);
+    await tv.close();
+  });
+
+  // tvOS 26.6 answered 0 once with AirPods attaching and absolute volume reported (0.75 later),
+  // and answers 0 for any unknown output UID, so 0 is not a reading.
+  it.each([
+    ['a zero reply', (conn: AirPlayConnection, identifier: string) =>
+      push(conn, { type: MessageType.GetVolumeResult, identifier, '.getVolumeResultMessage': { volume: 0 } })],
+    ['no reply', async () => {}],
+  ])('asks again on the next capability update after %s', async (_case, answer) => {
+    vi.useFakeTimers();
+    const { tv, requests, conn } = await connected(3, answer);
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(tv.volume).toBeUndefined();
+    await push(conn, { type: MessageType.VolumeControlAvailability, '.volumeControlAvailabilityMessage': { volumeControlAvailable: true, volumeCapabilities: 3 } });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(requests).toHaveLength(2);
+    await tv.close();
+  });
 });
