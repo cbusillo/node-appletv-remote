@@ -230,8 +230,8 @@ one, and their UpdateOutputDevice descriptors carry no volume.
 **Initial volume (#31):** tvOS sends VolumeDidChange only on a change, so over MRP the library
 asks with GetVolume once `featureAvailability('setVolume')` is `supported` and fills in
 `volume` (emitting `volume`) right after connecting; a later VolumeDidChange still updates it.
-With AirPods (AppleTV5,3 and AppleTV6,2, tvOS 26.6) and a HomePod (AppleTV14,1) the reply
-matched the level shown on the TV. A reply of 0 is ignored, because one came back while
+With AirPods (AppleTV6,2, tvOS 26.6) and a HomePod (AppleTV14,1) the reply matched the
+level shown on the TV. A reply of 0 is ignored, because one came back while
 AirPods were attaching, so an output that really is at 0 stays `undefined` until its volume
 changes. A failed or ignored query is retried on the next MRP message, normally a capability
 update. Detaching and reattaching AirPods pushes capability changes and VolumeDidChange (a
