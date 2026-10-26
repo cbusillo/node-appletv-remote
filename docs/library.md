@@ -215,8 +215,9 @@ currently disabled), `unsupported` (missing from a received MRP command list), o
 flags provide supported/unavailable evidence for play, pause, next, previous, skip, and
 volume; navigation and play/pause stay unknown because `_iMC` has no defined flags for
 them. A volume-capable `_iMC` update requests the reported volume and emits `volume` only
-for a finite 0–1 reply. Availability is advisory and may change at any time; device
-errors still reject. The event has no payload: re-query capabilities relevant to your
+for a finite 0–1 reply. Over MRP, `volume` is filled in right after connecting when the
+output supports absolute volume; a later `VolumeDidChange` still updates it. Availability
+is advisory and may change at any time; device errors still reject. The event has no payload: re-query capabilities relevant to your
 application.
 
 **Volume on tvOS 26 (#39):** on the tested devices `volume` stayed `undefined` and the
@@ -226,29 +227,6 @@ tested Apple TV reports volume control unavailable (most likely because the TV's
 under its control over CEC or IR; not confirmed), and another reports relative only (`volumeUp`/`volumeDown` supported, `setVolume`
 unsupported). Both answer a GetVolume request with 0 for every output UID, and their
 UpdateOutputDevice descriptors carry no volume.
-
-### Low-level volume queries
-
-For an already connected `AirPlayConnection`, the package entry exports the low-level
-`MRPMessage` builders and `MessageType` discriminators:
-
-```typescript
-import { MRPMessage, MessageType } from 'node-appletv-remote';
-
-const request = await MRPMessage.getVolume(outputDeviceUID);
-const reply = await connection.sendMRPMessageAndWait(request, MessageType.GetVolumeResult);
-const result = reply['.getVolumeResultMessage'] as { volume?: number } | undefined;
-const volume = result?.volume;
-```
-
-The caller selects the output UID and owns the connection. For the Apple TV's current
-output, take `clusterID || deviceUID` from its DeviceInfo message using an `mrp-message`
-listener attached before `connect()`. This identifies the device's output context, not the
-selected speaker's name. The request rejects on timeout or a protocol error reply. This
-reads a level without changing it; an absent volume remains `undefined`, distinct from a
-reported zero.
-It does not add an automatic startup query or a high-level `AppleTV` method. A zero
-reply alone does not establish that the output supports absolute volume control.
 
 **Idle Apple TV state (#10):** when no app has a loaded item, an Apple TV (seen on
 both tested models) answers the queue request with a typeless
@@ -272,7 +250,8 @@ Register `mrpDiagnostic` **before** `connect()` on an existing `AppleTV` instanc
 Import `MRPDiagnostic` as a type from `node-appletv-remote` when annotating listeners.
 Use a bounded capture connection; its in-memory token map keeps the 1024 most recently used identifiers (LRU), so recurring client/player tokens stay stable while request identifiers churn.
 The event emits only relevant init/state message types (including the
-GetVolumeControlCapabilities request, volume capability replies and changes, and tvOS 26
+GetVolumeControlCapabilities request, volume capability replies and changes, the GetVolume
+request and reply, and tvOS 26
 types 104/105), direction, opaque
 connection-local request/client/player tokens, and `matchedRequest` on receives
 (type plus identifier match before dispatch). Missing identifiers remain omitted;

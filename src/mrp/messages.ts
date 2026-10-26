@@ -164,7 +164,6 @@ async function encodeMessage(
 export class MRPMessage {
   /** Read the current level for one output without changing its volume. */
   static async getVolume(outputDeviceUID: string): Promise<Buffer> {
-    if (!outputDeviceUID) throw new TypeError('An output device identifier is required');
     return encodeMessage(MessageType.GetVolume, {
       key: '.getVolumeMessage',
       typeName: 'GetVolumeMessage',

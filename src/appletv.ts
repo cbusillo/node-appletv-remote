@@ -297,6 +297,7 @@ export class AppleTV extends EventEmitter {
   private gestureBusy = false;
   private companionVolume?: number;
   private mrpVolume?: number;
+  private mrpVolumeRequested = false;
   /** Last absolute volume (0..100) reported by the selected transport; undefined until one arrives. */
   volume?: number;
   powerState: PowerState = PowerState.Unknown;
@@ -363,6 +364,7 @@ export class AppleTV extends EventEmitter {
       await connection.connect();
       if (this.connection !== connection) throw new Error('Connection closed during setup');
       this.readyTransports.add(connection);
+      this.requestMRPVolume();
       this.emit('connect');
     } catch (err) {
       if (this.connection === connection) {
@@ -1207,6 +1209,7 @@ export class AppleTV extends EventEmitter {
         this.emit('volume', this.volume);
       }
     }
+    this.requestMRPVolume();
 
     // Handle KeyboardMessage (type 23)
     if (msg.type === MessageType.Keyboard) {
@@ -1237,12 +1240,36 @@ export class AppleTV extends EventEmitter {
     }
   }
 
+  /**
+   * Ask once per MRP session for the starting absolute volume, since VolumeDidChange arrives only
+   * on a change. Needs the output UID and absolute capability; a VolumeDidChange always wins, and
+   * a timeout, error reply, or out-of-range reply leaves `volume` unset.
+   */
+  private requestMRPVolume(): void {
+    const connection = this.connection;
+    const uid = this.outputDeviceUID;
+    const capabilities = this.volumeAvailability?.volumeCapabilities;
+    if (this.mrpVolumeRequested || !connection || !this.readyTransports.has(connection) || !uid) return;
+    if (this.mrpVolume !== undefined || (capabilities !== 2 && capabilities !== 3)) return;
+    this.mrpVolumeRequested = true;
+    void (async () => {
+      const reply = await connection.sendMRPMessageAndWait(await MRPMessage.getVolume(uid), MessageType.GetVolumeResult);
+      const volume = (reply['.getVolumeResultMessage'] as { volume?: unknown } | undefined)?.volume;
+      if (this.connection !== connection || this.outputDeviceUID !== uid || this.mrpVolume !== undefined) return;
+      if (!(typeof volume === 'number' && Number.isFinite(volume) && volume >= 0 && volume <= 1)) return;
+      this.mrpVolume = Math.round(volume * 1000) / 10;
+      this.volume = this.mrpVolume;
+      this.emit('volume', this.volume);
+    })().catch(() => {});
+  }
+
   /** Discard MRP runtime evidence when its transport session ends. */
   private resetRuntimeState(): void {
     this.playerState = new PlayerState();
     this.volumeAvailability = undefined;
     this.outputDeviceUID = undefined;
     this.mrpVolume = undefined;
+    this.mrpVolumeRequested = false;
     this.nowPlaying = new NowPlayingInfo({ hasPlayback: false }, {});
     const companionReady = this.companionConnection && this.readyTransports.has(this.companionConnection);
     const nextVolume = companionReady ? this.companionVolume : undefined;

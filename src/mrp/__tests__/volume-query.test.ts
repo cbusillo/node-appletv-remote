@@ -1,5 +1,4 @@
 import { describe, expect, it } from 'vitest';
-import * as entry from '../../index.js';
 import { MRPMessage, MessageType } from '../messages.js';
 
 // Independently encoded by pyatv 0.18.0, using synthetic identifiers only.
@@ -11,18 +10,14 @@ const fixtures = {
 };
 
 describe('read-only volume queries', () => {
-  it('encodes an explicit output request through the public API with fresh correlation identifiers', async () => {
-    expect(entry.MRPMessage).toBe(MRPMessage);
-    expect(entry.MessageType).toBe(MessageType);
+  it('encodes a request for one output with fresh correlation identifiers', async () => {
     const reference = await MRPMessage.decode(Buffer.from(fixtures.request, 'hex'));
-    const first = await entry.MRPMessage.getVolume('synthetic-output');
-    const decoded = await MRPMessage.decode(first);
+    const decoded = await MRPMessage.decode(await MRPMessage.getVolume('synthetic-output'));
     expect(decoded.type).toBe(reference.type);
     expect(decoded['.getVolumeMessage']).toEqual(reference['.getVolumeMessage']);
     expect(decoded.identifier).toBeTruthy();
-    const next = await MRPMessage.decode(await entry.MRPMessage.getVolume('synthetic-output'));
+    const next = await MRPMessage.decode(await MRPMessage.getVolume('synthetic-output'));
     expect(next.identifier).not.toBe(decoded.identifier);
-    await expect(entry.MRPMessage.getVolume('')).rejects.toThrow();
   });
 
   it('decodes an independently encoded result and keeps absent volume distinct from zero', async () => {

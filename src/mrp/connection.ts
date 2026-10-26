@@ -31,6 +31,8 @@ const DIAGNOSTIC_FIELDS: Partial<Record<MessageType, string>> = {
   [MessageType.GetVolumeControlCapabilities]: '',
   [MessageType.GetVolumeControlCapabilitiesResult]: '',
   [MessageType.VolumeControlCapabilitiesDidChange]: '',
+  [MessageType.GetVolume]: '',
+  [MessageType.GetVolumeResult]: '',
   [MessageType.PlayerClientProperties]: '.playerClientPropertiesMessage',
   [MessageType.OriginClientProperties]: '',
 };

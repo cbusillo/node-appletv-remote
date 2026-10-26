@@ -1,3 +1,4 @@
+// Type 50: reply to GetVolume (type 49); an absent volume stays distinct from 0.
 syntax = "proto2";
 
 import "ProtocolMessage.proto";
